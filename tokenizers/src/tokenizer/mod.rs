@@ -281,7 +281,7 @@ impl Tokenizer {
                             vec![(0, sentence.len())],
                             vec![0],
                             vec![1],
-                            None,
+                            vec![],
                         ));
                     }
 
@@ -317,7 +317,7 @@ impl Tokenizer {
                         offsets,
                         vec![0; length],
                         vec![1; length],
-                        None,
+                        vec![],
                     ))
                 })
                 .collect::<Result<Vec<Encoding>>>()?;
