@@ -11,7 +11,7 @@ WIP : WASM implementation of Tokenizer
 
 ## Notes
 
-Due to dependencies to console :
+Due to dependencies to console (which not build with wasm-pack), we need to make some changes in rust source code :
 - Need to copy ../../tokenizers to ./tkz
 - Remove file
 ./tkz/src/cli.rs
