@@ -1,17 +1,17 @@
 use serde_json::Value;
 use std::error;
 use std::fmt;
-use std::{
-  collections::HashMap,
-  io,
-  io::BufRead,
-};
+use std::{collections::HashMap, io, io::BufRead};
 use tokenizers::models::bpe::BPE;
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
 use tokenizers::tokenizer::{AddedToken, EncodeInput, Tokenizer};
 use wasm_bindgen::prelude::*;
 
+extern crate rayon;
+
 type Result<T> = std::result::Result<T, Error>;
+
+static BATCH_SIZE: usize = 1_000;
 
 #[derive(Debug)]
 pub enum Error {
@@ -23,13 +23,13 @@ pub enum Error {
 
 impl From<io::Error> for Error {
   fn from(error: io::Error) -> Self {
-      Error::Io(error)
+    Error::Io(error)
   }
 }
 
 impl From<serde_json::Error> for Error {
   fn from(error: serde_json::Error) -> Self {
-      Error::JsonError(error)
+    Error::JsonError(error)
   }
 }
 
@@ -135,11 +135,48 @@ fn build(vocab_src: &[u8], merges_src: &[u8]) -> Result<Tokenizer> {
 }
 
 #[wasm_bindgen]
-pub fn bench(vocab: &[u8], merges: &[u8], _inputs: &[u8]) {
+pub fn bench(vocab: &[u8], merges: &[u8], inputs: &[u8]) {
   alert("Bench starting !");
+  
+  // rayon::ThreadPoolBuilder::new().num_threads(1).build_global().unwrap();
+
   let tokenizer = build(vocab, merges).unwrap();
 
-  let encoding = tokenizer.encode(EncodeInput::Single("Hey there!".into())).unwrap();
+  let mut lines: Vec<EncodeInput> = vec![];
+  let mut batches: Vec<Vec<EncodeInput>> = vec![vec![]];
+  for line in inputs.lines().map(line_to_input) {
+    lines.push(line.clone());
+    if batches.last().unwrap().len() >= BATCH_SIZE {
+      batches.push(vec![]);
+    }
+    batches.last_mut().unwrap().push(line);
+  }
+  let iters = 2000;
+  let mut line_index: usize = 0;
+  for _i in 0..iters {
+    if line_index >= lines.len() {
+      line_index = 0;
+    }
+    let input = lines[line_index].clone();
+    let encoding = tokenizer.encode(input).unwrap();
+    encoding.get_tokens();
+  }
+  alert("Bench batch !");
+  let mut batch_index: usize = 0;
+  for _i in 0..iters {
+    if batch_index >= batches.len() {
+      batch_index = 0;
+    }
+    let batch = batches[batch_index].clone();
+    alert(&format!("batch: {:?}", batch.len()));
+    // tokenizer.encode_batch(batch).unwrap();
+    if let Err(err) =  tokenizer.encode_batch(batch) {
+      alert(&format!("Batch error: {:?}", err));
+  }
+  }
+  let encoding = tokenizer
+    .encode(EncodeInput::Single("Hey there!".into()))
+    .unwrap();
   alert(&format!("tokens: {:?}", encoding.get_tokens()));
   alert("Bench done !");
 }
