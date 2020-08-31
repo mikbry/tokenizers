@@ -1,4 +1,6 @@
 use crate::tokenizer::{NormalizedString, Normalizer, Result};
+
+use serde::{Deserialize, Serialize};
 use unicode_categories::UnicodeCategories;
 
 /// Checks whether a character is whitespace
@@ -47,6 +49,8 @@ fn is_chinese_char(c: char) -> bool {
     }
 }
 
+#[derive(Copy, Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "type")]
 pub struct BertNormalizer {
     /// Whether to do the bert basic cleaning:
     ///   1. Remove any control characters
@@ -55,16 +59,27 @@ pub struct BertNormalizer {
     /// Whether to put spaces around chinese characters so they get split
     handle_chinese_chars: bool,
     /// Whether to strip accents
-    strip_accents: bool,
+    strip_accents: Option<bool>,
     /// Whether to lowercase the input
     lowercase: bool,
+}
+
+impl Default for BertNormalizer {
+    fn default() -> Self {
+        Self {
+            clean_text: true,
+            handle_chinese_chars: true,
+            strip_accents: None,
+            lowercase: true,
+        }
+    }
 }
 
 impl BertNormalizer {
     pub fn new(
         clean_text: bool,
         handle_chinese_chars: bool,
-        strip_accents: bool,
+        strip_accents: Option<bool>,
         lowercase: bool,
     ) -> Self {
         BertNormalizer {
@@ -77,7 +92,7 @@ impl BertNormalizer {
 
     fn do_clean_text(&self, normalized: &mut NormalizedString) {
         normalized
-            .filter(|c| !(*c as usize == 0 || *c as usize == 0xfffd || is_control(*c)))
+            .filter(|c| !(c as usize == 0 || c as usize == 0xfffd || is_control(c)))
             .map(|c| if is_whitespace(c) { ' ' } else { c });
     }
 
@@ -85,7 +100,7 @@ impl BertNormalizer {
         let mut new_chars: Vec<(char, isize)> = vec![];
         normalized.for_each(|c| {
             if is_chinese_char(c) {
-                new_chars.extend(&[(' ', 1), (c, 0), (' ', 1)]);
+                new_chars.extend(&[(' ', 0), (c, 1), (' ', 1)]);
             } else {
                 new_chars.push((c, 0));
             }
@@ -103,18 +118,19 @@ impl BertNormalizer {
 }
 
 impl Normalizer for BertNormalizer {
-    fn normalize(&self, mut normalized: &mut NormalizedString) -> Result<()> {
+    fn normalize(&self, normalized: &mut NormalizedString) -> Result<()> {
         if self.clean_text {
-            self.do_clean_text(&mut normalized);
+            self.do_clean_text(normalized);
         }
         if self.handle_chinese_chars {
-            self.do_handle_chinese_chars(&mut normalized);
+            self.do_handle_chinese_chars(normalized);
         }
-        if self.strip_accents {
-            self.do_strip_accents(&mut normalized);
+        let strip_accents = self.strip_accents.unwrap_or(self.lowercase);
+        if strip_accents {
+            self.do_strip_accents(normalized);
         }
         if self.lowercase {
-            self.do_lowercase(&mut normalized);
+            self.do_lowercase(normalized);
         }
 
         Ok(())

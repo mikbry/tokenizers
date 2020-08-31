@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::RwLock;
@@ -9,6 +10,7 @@ pub static DEFAULT_CACHE_CAPACITY: usize = 10_000;
 /// concurrently but won't block if another thread is writing.
 /// The goal is clearly not the accuracy of the content, both get and set
 /// are not guaranteed to actually get or set.
+#[derive(Debug)]
 pub(super) struct Cache<K, V>
 where
     K: Eq + Hash + Clone,
@@ -16,6 +18,17 @@ where
 {
     map: RwLock<HashMap<K, V>>,
     pub capacity: usize,
+}
+
+// We dont really care about Cache comparison, so let's make them always equal
+impl<K, V> PartialEq for Cache<K, V>
+where
+    K: Eq + Hash + Clone,
+    V: Clone,
+{
+    fn eq(&self, _other: &Cache<K, V>) -> bool {
+        true
+    }
 }
 
 impl<K, V> Default for Cache<K, V>
@@ -49,25 +62,39 @@ where
         self.map.write().unwrap().clear();
     }
 
-    pub(super) fn get_values<I>(&self, keys_iter: I) -> Option<Vec<Option<V>>>
+    #[allow(dead_code)]
+    pub(super) fn get_values<'a, I, Q>(&self, keys_iter: I) -> Option<Vec<Option<V>>>
     where
-        I: Iterator<Item = K>,
+        I: Iterator<Item = &'a Q>,
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized + 'a,
     {
         if let Ok(ref mut cache) = self.map.try_read() {
-            Some(keys_iter.map(|k| cache.get(&k).cloned()).collect())
+            Some(keys_iter.map(|k| cache.get(k).cloned()).collect())
         } else {
             None
         }
     }
 
-    pub(super) fn set_values<I, J>(&self, keys_iter: I, values_iter: J)
+    pub(super) fn get<Q>(&self, key: &Q) -> Option<V>
     where
-        I: Iterator<Item = K>,
-        J: Iterator<Item = Option<V>>,
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        if let Ok(ref mut cache) = self.map.try_read() {
+            cache.get(key).cloned()
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn set_values<I>(&self, entries: I)
+    where
+        I: IntoIterator<Item = (K, V)>,
     {
         // Before trying to acquire a write lock, we check if we are already at
         // capacity with a read handler.
-        if let Ok(ref mut cache) = self.map.try_read() {
+        if let Ok(cache) = self.map.try_read() {
             if cache.len() >= self.capacity {
                 // At capacity, so do nothing.
                 return;
@@ -77,15 +104,15 @@ where
             // a write handle one quadrillionth of a second later.
             return;
         }
+
         // Not at capacity, so try acquiring a write handle.
-        if let Ok(ref mut cache) = self.map.try_write() {
-            for (key, value) in keys_iter.zip(values_iter).filter(|(_, v)| v.is_some()) {
-                // If already at capacity, don't add any more values.
-                if cache.len() >= self.capacity {
-                    break;
-                }
-                cache.insert(key, value.unwrap());
-            }
+        if let Ok(mut cache) = self.map.try_write() {
+            let free = self.capacity - cache.len();
+            cache.extend(entries.into_iter().take(free));
         }
+    }
+
+    pub(super) fn set(&self, key: K, value: V) {
+        self.set_values(std::iter::once((key, value)))
     }
 }

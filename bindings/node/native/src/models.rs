@@ -1,88 +1,143 @@
 extern crate tokenizers as tk;
 
-use crate::utils::Container;
+use crate::extraction::*;
+use crate::tasks::models::{BPEFromFilesTask, WordPieceFromFilesTask};
 use neon::prelude::*;
+use std::collections::HashMap;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use tk::models::{bpe::BpeBuilder, wordpiece::WordPieceBuilder, ModelWrapper};
+use tk::Model as ModelTrait;
+use tk::Token;
 
 /// Model
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Model {
-    pub model: Container<dyn tk::tokenizer::Model + Sync>,
+    #[serde(flatten)]
+    pub model: Option<Arc<ModelWrapper>>,
+}
+
+impl From<ModelWrapper> for Model {
+    fn from(wrapper: ModelWrapper) -> Self {
+        Self {
+            model: Some(Arc::new(wrapper)),
+        }
+    }
+}
+
+impl tk::Model for Model {
+    fn tokenize(&self, sequence: &str) -> tk::Result<Vec<Token>> {
+        self.model
+            .as_ref()
+            .ok_or("Uninitialized Model")?
+            .tokenize(sequence)
+    }
+
+    fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.model.as_ref()?.token_to_id(token)
+    }
+
+    fn id_to_token(&self, id: u32) -> Option<&str> {
+        self.model.as_ref()?.id_to_token(id)
+    }
+
+    fn get_vocab(&self) -> &HashMap<String, u32> {
+        self.model
+            .as_ref()
+            .expect("Uninitialized Model")
+            .get_vocab()
+    }
+
+    fn get_vocab_size(&self) -> usize {
+        self.model
+            .as_ref()
+            .expect("Uninitialized Model")
+            .get_vocab_size()
+    }
+
+    fn save(&self, folder: &Path, name: Option<&str>) -> tk::Result<Vec<PathBuf>> {
+        self.model
+            .as_ref()
+            .ok_or("Uninitialized Model")?
+            .save(folder, name)
+    }
 }
 
 declare_types! {
     pub class JsModel for Model {
         init(_) {
             // This should not be called from JS
-            Ok(Model {
-                model: Container::Empty
-            })
+            Ok(Model { model: None })
+        }
+
+        method save(mut cx) {
+            // save(folder: string, name?: string)
+            let folder = cx.extract::<String>(0)?;
+            let name = cx.extract_opt::<String>(1)?;
+
+            let this = cx.this();
+            let guard = cx.lock();
+
+            let files = this.borrow(&guard)
+                .model.as_ref().unwrap()
+                .save(
+                    Path::new(&folder),
+                    name.as_deref()
+                )
+                .map_err(|e| Error(format!("{}", e)))?;
+
+            Ok(neon_serde::to_value(&mut cx, &files)?)
         }
     }
 }
 
-/// bpe_from_files(vocab: String, merges: String, options?: {
-///   cache_capacity?: number,
-///   dropout?: number,
-///   unk_token?: String,
-///   continuing_subword_prefix?: String,
-///   end_of_word_suffix?: String
-/// })
-pub fn bpe_from_files(mut cx: FunctionContext) -> JsResult<JsModel> {
-    let vocab = cx.argument::<JsString>(0)?.value() as String;
-    let merges = cx.argument::<JsString>(1)?.value() as String;
-    let options = cx.argument_opt(2);
-
-    let mut model = JsModel::new::<_, JsModel, _>(&mut cx, vec![])?;
-    let mut builder = tk::models::bpe::BPE::from_files(&vocab, &merges)
-        .or_else(|e| cx.throw_error(format!("{}", e)))?;
-
-    if let Some(options) = options {
-        if let Ok(options) = options.downcast::<JsObject>() {
-            if let Ok(cache_capacity) = options.get(&mut cx, "cache_capacity") {
-                if let Err(_) = cache_capacity.downcast::<JsUndefined>() {
-                    let cache_capacity = cache_capacity
-                        .downcast::<JsNumber>()
-                        .or_throw(&mut cx)?
-                        .value() as usize;
-                    builder = builder.cache_capacity(cache_capacity);
-                }
-            }
-            if let Ok(dropout) = options.get(&mut cx, "dropout") {
-                if let Err(_) = dropout.downcast::<JsUndefined>() {
-                    let dropout = dropout.downcast::<JsNumber>().or_throw(&mut cx)?.value() as f32;
-                    builder = builder.dropout(dropout);
-                }
-            }
-            if let Ok(unk_token) = options.get(&mut cx, "unk_token") {
-                if let Err(_) = unk_token.downcast::<JsUndefined>() {
-                    let unk_token =
-                        unk_token.downcast::<JsString>().or_throw(&mut cx)?.value() as String;
-                    builder = builder.unk_token(unk_token);
-                }
-            }
-            if let Ok(prefix) = options.get(&mut cx, "continuing_subword_prefix") {
-                if let Err(_) = prefix.downcast::<JsUndefined>() {
-                    let prefix = prefix.downcast::<JsString>().or_throw(&mut cx)?.value() as String;
-                    builder = builder.continuing_subword_prefix(prefix);
-                }
-            }
-            if let Ok(suffix) = options.get(&mut cx, "end_of_word_suffix") {
-                if let Err(_) = suffix.downcast::<JsUndefined>() {
-                    let suffix = suffix.downcast::<JsString>().or_throw(&mut cx)?.value() as String;
-                    builder = builder.end_of_word_suffix(suffix);
-                }
-            }
+#[derive(Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct BpeOptions {
+    cache_capacity: Option<usize>,
+    dropout: Option<usize>,
+    unk_token: Option<String>,
+    continuing_subword_prefix: Option<String>,
+    end_of_word_suffix: Option<String>,
+}
+impl BpeOptions {
+    fn apply_to_bpe_builder(self, mut builder: BpeBuilder) -> BpeBuilder {
+        if let Some(cache_capacity) = self.cache_capacity {
+            builder = builder.cache_capacity(cache_capacity);
         }
+
+        builder
     }
+}
 
-    match builder.build() {
-        Ok(bpe) => {
-            let guard = cx.lock();
-            model.borrow_mut(&guard).model.to_owned(Box::new(bpe));
-        }
-        Err(e) => return cx.throw_error(format!("{}", e)),
+/// bpe_from_files(vocab: String, merges: String, options: {
+///   cacheCapacity?: number,
+///   dropout?: number,
+///   unkToken?: String,
+///   continuingSubwordPrefix?: String,
+///   endOfWordSuffix?: String
+/// }, callback)
+pub fn bpe_from_files(mut cx: FunctionContext) -> JsResult<JsUndefined> {
+    let vocab = cx.extract::<String>(0)?;
+    let merges = cx.extract::<String>(1)?;
+
+    let (options, callback) = match cx.extract_opt::<BpeOptions>(2) {
+        // Options were there, and extracted
+        Ok(Some(options)) => (options, cx.argument::<JsFunction>(3)?),
+        // Options were undefined or null
+        Ok(None) => (BpeOptions::default(), cx.argument::<JsFunction>(3)?),
+        // Options not specified, callback instead
+        Err(_) => (BpeOptions::default(), cx.argument::<JsFunction>(2)?),
     };
 
-    Ok(model)
+    let mut builder = tk::models::bpe::BPE::from_files(&vocab, &merges);
+    builder = options.apply_to_bpe_builder(builder);
+
+    let task = BPEFromFilesTask::new(builder);
+    task.schedule(callback);
+    Ok(cx.undefined())
 }
 
 /// bpe_empty()
@@ -91,47 +146,57 @@ pub fn bpe_empty(mut cx: FunctionContext) -> JsResult<JsModel> {
     let bpe = tk::models::bpe::BPE::default();
 
     let guard = cx.lock();
-    model.borrow_mut(&guard).model.to_owned(Box::new(bpe));
+    model.borrow_mut(&guard).model = Some(Arc::new(bpe.into()));
 
     Ok(model)
 }
 
-/// wordpiece_from_files(vocab: String, options?: {
+#[derive(Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct WordPieceOptions {
+    unk_token: Option<String>,
+    continuing_subword_prefix: Option<String>,
+    max_input_chars_per_word: Option<usize>,
+}
+impl WordPieceOptions {
+    fn apply_to_wordpiece_builder(self, mut builder: WordPieceBuilder) -> WordPieceBuilder {
+        if let Some(token) = self.unk_token {
+            builder = builder.unk_token(token);
+        }
+        if let Some(prefix) = self.continuing_subword_prefix {
+            builder = builder.continuing_subword_prefix(prefix);
+        }
+        if let Some(max) = self.max_input_chars_per_word {
+            builder = builder.max_input_chars_per_word(max);
+        }
+
+        builder
+    }
+}
+
+/// wordpiece_from_files(vocab: String, options: {
 ///   unkToken?: String = "[UNK]",
 ///   maxInputCharsPerWord?: number = 100,
-/// })
-pub fn wordpiece_from_files(mut cx: FunctionContext) -> JsResult<JsModel> {
-    let vocab = cx.argument::<JsString>(0)?.value() as String;
-    let options = cx.argument_opt(1);
+///   continuingSubwordPrefix?: "##",
+/// }, callback)
+pub fn wordpiece_from_files(mut cx: FunctionContext) -> JsResult<JsUndefined> {
+    let vocab = cx.extract::<String>(0)?;
 
-    let mut unk_token = String::from("[UNK]");
-    let mut max_input_chars_per_word = Some(100);
+    let (options, callback) = match cx.extract_opt::<WordPieceOptions>(1) {
+        // Options were there, and extracted
+        Ok(Some(options)) => (options, cx.argument::<JsFunction>(2)?),
+        // Options were undefined or null
+        Ok(None) => (WordPieceOptions::default(), cx.argument::<JsFunction>(2)?),
+        // Options not specified, callback instead
+        Err(_) => (WordPieceOptions::default(), cx.argument::<JsFunction>(1)?),
+    };
 
-    if let Some(options) = options {
-        if let Ok(options) = options.downcast::<JsObject>() {
-            if let Ok(unk) = options.get(&mut cx, "unkToken") {
-                if let Err(_) = unk.downcast::<JsUndefined>() {
-                    unk_token = unk.downcast::<JsString>().or_throw(&mut cx)?.value() as String;
-                }
-            }
-            if let Ok(max) = options.get(&mut cx, "maxInputCharsPerWord") {
-                if let Err(_) = max.downcast::<JsUndefined>() {
-                    max_input_chars_per_word =
-                        Some(max.downcast::<JsNumber>().or_throw(&mut cx)?.value() as usize);
-                }
-            }
-        }
-    }
+    let mut builder = tk::models::wordpiece::WordPiece::from_files(&vocab);
+    builder = options.apply_to_wordpiece_builder(builder);
 
-    let wordpiece =
-        tk::models::wordpiece::WordPiece::from_files(&vocab, unk_token, max_input_chars_per_word)
-            .or_else(|e| cx.throw_error(format!("{}", e)))?;
-
-    let mut model = JsModel::new::<_, JsModel, _>(&mut cx, vec![])?;
-    let guard = cx.lock();
-    model.borrow_mut(&guard).model.to_owned(Box::new(wordpiece));
-
-    Ok(model)
+    let task = WordPieceFromFilesTask::new(builder);
+    task.schedule(callback);
+    Ok(cx.undefined())
 }
 
 /// wordpiece_empty()
@@ -140,7 +205,7 @@ pub fn wordpiece_empty(mut cx: FunctionContext) -> JsResult<JsModel> {
     let wordpiece = tk::models::wordpiece::WordPiece::default();
 
     let guard = cx.lock();
-    model.borrow_mut(&guard).model.to_owned(Box::new(wordpiece));
+    model.borrow_mut(&guard).model = Some(Arc::new(wordpiece.into()));
 
     Ok(model)
 }

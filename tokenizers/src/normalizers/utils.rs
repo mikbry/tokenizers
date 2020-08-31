@@ -1,13 +1,18 @@
+use serde::{Deserialize, Serialize};
+
+use crate::normalizers::NormalizerWrapper;
 use crate::tokenizer::{NormalizedString, Normalizer, Result};
 
+#[derive(Clone, Deserialize, Debug, Serialize)]
+#[serde(tag = "type")]
 /// Allows concatenating multiple other Normalizer as a Sequence.
 /// All the normalizers run in sequence in the given order against the same NormalizedString.
 pub struct Sequence {
-    normalizers: Vec<Box<dyn Normalizer + Sync>>,
+    normalizers: Vec<NormalizerWrapper>,
 }
 
 impl Sequence {
-    pub fn new(normalizers: Vec<Box<dyn Normalizer + Sync>>) -> Self {
+    pub fn new(normalizers: Vec<NormalizerWrapper>) -> Self {
         Self { normalizers }
     }
 }
@@ -22,6 +27,7 @@ impl Normalizer for Sequence {
 }
 
 /// Lowercases the input
+#[derive(Copy, Clone, Debug)]
 pub struct Lowercase;
 impl Normalizer for Lowercase {
     fn normalize(&self, normalized: &mut NormalizedString) -> Result<()> {
@@ -29,3 +35,5 @@ impl Normalizer for Lowercase {
         Ok(())
     }
 }
+
+impl_serde_unit_struct!(LowercaseVisitor, Lowercase);

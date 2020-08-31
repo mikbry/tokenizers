@@ -1,25 +1,57 @@
-extern crate tokenizers as tk;
+use std::collections::HashMap;
+use std::sync::Arc;
 
-use super::utils::Container;
+use pyo3::exceptions;
 use pyo3::prelude::*;
 use pyo3::types::*;
+use tk::models::TrainerWrapper;
+use tk::Trainer;
+use tokenizers as tk;
 
-#[pyclass]
-pub struct Trainer {
-    pub trainer: Container<dyn tk::tokenizer::Trainer>,
+use crate::models::PyModel;
+use crate::tokenizer::PyAddedToken;
+
+#[pyclass(name=Trainer)]
+pub struct PyTrainer {
+    pub trainer: TrainerWrapper,
 }
 
-#[pyclass]
-pub struct BpeTrainer {}
+impl PyTrainer {
+    pub fn new(trainer: TrainerWrapper) -> Self {
+        PyTrainer { trainer }
+    }
+}
+
+impl Trainer for PyTrainer {
+    type Model = PyModel;
+
+    fn should_show_progress(&self) -> bool {
+        self.trainer.should_show_progress()
+    }
+
+    fn train(&self, words: HashMap<String, u32>) -> tk::Result<(PyModel, Vec<tk::AddedToken>)> {
+        self.trainer.train(words).map(|(m, t)| {
+            let m = PyModel { model: Arc::new(m) };
+            (m, t)
+        })
+    }
+
+    fn process_tokens(&self, words: &mut HashMap<String, u32>, tokens: Vec<String>) {
+        self.trainer.process_tokens(words, tokens)
+    }
+}
+
+#[pyclass(extends=PyTrainer, name=BpeTrainer)]
+pub struct PyBpeTrainer {}
 #[pymethods]
-impl BpeTrainer {
+impl PyBpeTrainer {
     /// new(/ vocab_size, min_frequency)
     /// --
     ///
     /// Create a new BpeTrainer with the given configuration
-    #[staticmethod]
+    #[new]
     #[args(kwargs = "**")]
-    pub fn new(kwargs: Option<&PyDict>) -> PyResult<Trainer> {
+    pub fn new(kwargs: Option<&PyDict>) -> PyResult<(Self, PyTrainer)> {
         let mut builder = tk::models::bpe::BpeTrainer::builder();
         if let Some(kwargs) = kwargs {
             for (key, val) in kwargs {
@@ -28,7 +60,27 @@ impl BpeTrainer {
                     "vocab_size" => builder = builder.vocab_size(val.extract()?),
                     "min_frequency" => builder = builder.min_frequency(val.extract()?),
                     "show_progress" => builder = builder.show_progress(val.extract()?),
-                    "special_tokens" => builder = builder.special_tokens(val.extract()?),
+                    "special_tokens" => {
+                        builder = builder.special_tokens(
+                            val.cast_as::<PyList>()?
+                                .into_iter()
+                                .map(|token| {
+                                    if let Ok(content) = token.extract::<String>() {
+                                        Ok(PyAddedToken::from(content, Some(true)).get_token())
+                                    } else if let Ok(mut token) =
+                                        token.extract::<PyRefMut<PyAddedToken>>()
+                                    {
+                                        token.is_special_token = true;
+                                        Ok(token.get_token())
+                                    } else {
+                                        Err(exceptions::Exception::py_err(
+                                            "special_tokens must be a List[Union[str, AddedToken]]",
+                                        ))
+                                    }
+                                })
+                                .collect::<PyResult<Vec<_>>>()?,
+                        );
+                    }
                     "limit_alphabet" => builder = builder.limit_alphabet(val.extract()?),
                     "initial_alphabet" => {
                         let alphabet: Vec<String> = val.extract()?;
@@ -49,24 +101,21 @@ impl BpeTrainer {
                 };
             }
         }
-
-        Ok(Trainer {
-            trainer: Container::Owned(Box::new(builder.build())),
-        })
+        Ok((PyBpeTrainer {}, PyTrainer::new(builder.build().into())))
     }
 }
 
-#[pyclass]
-pub struct WordPieceTrainer {}
+#[pyclass(extends=PyTrainer, name=WordPieceTrainer)]
+pub struct PyWordPieceTrainer {}
 #[pymethods]
-impl WordPieceTrainer {
+impl PyWordPieceTrainer {
     /// new(/ vocab_size, min_frequency)
     /// --
     ///
     /// Create a new BpeTrainer with the given configuration
-    #[staticmethod]
+    #[new]
     #[args(kwargs = "**")]
-    pub fn new(kwargs: Option<&PyDict>) -> PyResult<Trainer> {
+    pub fn new(kwargs: Option<&PyDict>) -> PyResult<(Self, PyTrainer)> {
         let mut builder = tk::models::wordpiece::WordPieceTrainer::builder();
         if let Some(kwargs) = kwargs {
             for (key, val) in kwargs {
@@ -75,7 +124,27 @@ impl WordPieceTrainer {
                     "vocab_size" => builder = builder.vocab_size(val.extract()?),
                     "min_frequency" => builder = builder.min_frequency(val.extract()?),
                     "show_progress" => builder = builder.show_progress(val.extract()?),
-                    "special_tokens" => builder = builder.special_tokens(val.extract()?),
+                    "special_tokens" => {
+                        builder = builder.special_tokens(
+                            val.cast_as::<PyList>()?
+                                .into_iter()
+                                .map(|token| {
+                                    if let Ok(content) = token.extract::<String>() {
+                                        Ok(PyAddedToken::from(content, Some(true)).get_token())
+                                    } else if let Ok(mut token) =
+                                        token.extract::<PyRefMut<PyAddedToken>>()
+                                    {
+                                        token.is_special_token = true;
+                                        Ok(token.get_token())
+                                    } else {
+                                        Err(exceptions::Exception::py_err(
+                                            "special_tokens must be a List[Union[str, AddedToken]]",
+                                        ))
+                                    }
+                                })
+                                .collect::<PyResult<Vec<_>>>()?,
+                        );
+                    }
                     "limit_alphabet" => builder = builder.limit_alphabet(val.extract()?),
                     "initial_alphabet" => {
                         let alphabet: Vec<String> = val.extract()?;
@@ -97,8 +166,9 @@ impl WordPieceTrainer {
             }
         }
 
-        Ok(Trainer {
-            trainer: Container::Owned(Box::new(builder.build())),
-        })
+        Ok((
+            PyWordPieceTrainer {},
+            PyTrainer::new(builder.build().into()),
+        ))
     }
 }

@@ -1,22 +1,30 @@
 extern crate tokenizers as tk;
 
-use tk::tokenizer::PaddingDirection;
-
-use crate::utils::Container;
+use crate::extraction::*;
+use crate::tokenizer::PaddingParams;
 use neon::prelude::*;
 
 /// Encoding
 pub struct Encoding {
-    pub encoding: Container<tk::tokenizer::Encoding>,
+    pub encoding: Option<tk::tokenizer::Encoding>,
 }
 
 declare_types! {
     pub class JsEncoding for Encoding {
         init(_) {
             // This should never be called from JavaScript
-            Ok(Encoding {
-                encoding: Container::Empty
-            })
+            Ok(Encoding { encoding: None })
+        }
+
+        method getLength(mut cx) {
+            let this = cx.this();
+            let guard = cx.lock();
+            let length = this.borrow(&guard)
+                .encoding.as_ref().expect("Uninitialized Encoding")
+                .get_ids()
+                .len();
+
+            Ok(cx.number(length as f64).upcast())
         }
 
         method getIds(mut cx) {
@@ -24,16 +32,12 @@ declare_types! {
 
             let this = cx.this();
             let guard = cx.lock();
-            let ids = this.borrow(&guard).encoding.execute(|encoding| {
-                encoding.unwrap().get_ids().to_vec()
-            });
-            let js_ids = JsArray::new(&mut cx, ids.len() as u32);
-            for (i, id) in ids.into_iter().enumerate() {
-                let n = JsNumber::new(&mut cx, id as f64);
-                js_ids.set(&mut cx, i as u32, n)?;
-            }
+            let ids = this.borrow(&guard)
+                .encoding.as_ref().expect("Uninitialized Encoding")
+                .get_ids()
+                .to_vec();
 
-            Ok(js_ids.upcast())
+            Ok(neon_serde::to_value(&mut cx, &ids)?)
         }
 
         method getTypeIds(mut cx) {
@@ -41,16 +45,12 @@ declare_types! {
 
             let this = cx.this();
             let guard = cx.lock();
-            let ids = this.borrow(&guard).encoding.execute(|encoding| {
-                encoding.unwrap().get_type_ids().to_vec()
-            });
-            let js_ids = JsArray::new(&mut cx, ids.len() as u32);
-            for (i, id) in ids.into_iter().enumerate() {
-                let n = JsNumber::new(&mut cx, id as f64);
-                js_ids.set(&mut cx, i as u32, n)?;
-            }
+            let ids = this.borrow(&guard)
+                .encoding.as_ref().expect("Uninitialized Encoding")
+                .get_type_ids()
+                .to_vec();
 
-            Ok(js_ids.upcast())
+            Ok(neon_serde::to_value(&mut cx, &ids)?)
         }
 
         method getAttentionMask(mut cx) {
@@ -58,16 +58,12 @@ declare_types! {
 
             let this = cx.this();
             let guard = cx.lock();
-            let ids = this.borrow(&guard).encoding.execute(|encoding| {
-                encoding.unwrap().get_attention_mask().to_vec()
-            });
-            let js_ids = JsArray::new(&mut cx, ids.len() as u32);
-            for (i, id) in ids.into_iter().enumerate() {
-                let n = JsNumber::new(&mut cx, id as f64);
-                js_ids.set(&mut cx, i as u32, n)?;
-            }
+            let ids = this.borrow(&guard)
+                .encoding.as_ref().expect("Uninitialized Encoding")
+                .get_attention_mask()
+                .to_vec();
 
-            Ok(js_ids.upcast())
+            Ok(neon_serde::to_value(&mut cx, &ids)?)
         }
 
         method getSpecialTokensMask(mut cx) {
@@ -75,16 +71,12 @@ declare_types! {
 
             let this = cx.this();
             let guard = cx.lock();
-            let ids = this.borrow(&guard).encoding.execute(|encoding| {
-                encoding.unwrap().get_special_tokens_mask().to_vec()
-            });
-            let js_ids = JsArray::new(&mut cx, ids.len() as u32);
-            for (i, id) in ids.into_iter().enumerate() {
-                let n = JsNumber::new(&mut cx, id as f64);
-                js_ids.set(&mut cx, i as u32, n)?;
-            }
+            let ids = this.borrow(&guard)
+                .encoding.as_ref().expect("Uninitialized Encoding")
+                .get_special_tokens_mask()
+                .to_vec();
 
-            Ok(js_ids.upcast())
+            Ok(neon_serde::to_value(&mut cx, &ids)?)
         }
 
         method getTokens(mut cx) {
@@ -92,16 +84,25 @@ declare_types! {
 
             let this = cx.this();
             let guard = cx.lock();
-            let tokens = this.borrow(&guard).encoding.execute(|encoding| {
-                encoding.unwrap().get_tokens().to_vec()
-            });
-            let js_tokens = JsArray::new(&mut cx, tokens.len() as u32);
-            for (i, token) in tokens.into_iter().enumerate() {
-                let n = JsString::new(&mut cx, token);
-                js_tokens.set(&mut cx, i as u32, n)?;
-            }
+            let tokens = this.borrow(&guard)
+                .encoding.as_ref().expect("Uninitialized Encoding")
+                .get_tokens()
+                .to_vec();
 
-            Ok(js_tokens.upcast())
+            Ok(neon_serde::to_value(&mut cx, &tokens)?)
+        }
+
+        method getWords(mut cx) {
+            // getWords(): number[]
+
+            let this = cx.this();
+            let guard = cx.lock();
+            let ids = this.borrow(&guard)
+                .encoding.as_ref().expect("Uninitialized Encoding")
+                .get_words()
+                .to_vec();
+
+            Ok(neon_serde::to_value(&mut cx, &ids)?)
         }
 
         method getOffsets(mut cx) {
@@ -109,40 +110,146 @@ declare_types! {
 
             let this = cx.this();
             let guard = cx.lock();
-            let offsets = this.borrow(&guard).encoding.execute(|encoding| {
-                encoding.unwrap().get_offsets().to_vec()
-            });
-            let js_offsets = JsArray::new(&mut cx, offsets.len() as u32);
-            for (i, offsets) in offsets.into_iter().enumerate() {
-                let n = JsArray::new(&mut cx, 2);
-                let o_0 = JsNumber::new(&mut cx, offsets.0 as f64);
-                let o_1 = JsNumber::new(&mut cx, offsets.1 as f64);
-                n.set(&mut cx, 0, o_0)?;
-                n.set(&mut cx, 1, o_1)?;
-                js_offsets.set(&mut cx, i as u32, n)?;
-            }
+            let offsets = this.borrow(&guard)
+                .encoding.as_ref().expect("Uninitialized Encoding")
+                .get_offsets()
+                .to_vec();
+            let js_offsets = neon_serde::to_value(&mut cx, &offsets)?;
 
-            Ok(js_offsets.upcast())
+            Ok(js_offsets)
         }
 
         method getOverflowing(mut cx) {
-            // getOverflowing(): Encoding | undefined;
+            // getOverflowing(): Encoding[]
 
             let this = cx.this();
             let guard = cx.lock();
 
-            let overflowing = this.borrow(&guard).encoding.execute(|encoding| {
-                encoding.unwrap().get_overflowing().cloned()
-            });
+            let overflowings = this.borrow(&guard)
+                .encoding.as_ref().expect("Uninitialized Encoding")
+                .get_overflowing()
+                .clone();
+            let js_overflowings = JsArray::new(&mut cx, overflowings.len() as u32);
 
-            if let Some(overflowing) = overflowing {
+            for (index, overflowing) in overflowings.iter().enumerate() {
                 let mut js_overflowing = JsEncoding::new::<_, JsEncoding, _>(&mut cx, vec![])?;
 
                 // Set the content
                 let guard = cx.lock();
-                js_overflowing.borrow_mut(&guard).encoding.to_owned(Box::new(overflowing));
+                js_overflowing.borrow_mut(&guard).encoding = Some(overflowing.clone());
 
-                Ok(js_overflowing.upcast())
+                js_overflowings.set(&mut cx, index as u32, js_overflowing)?;
+            }
+
+            Ok(js_overflowings.upcast())
+        }
+
+        method wordToTokens(mut cx) {
+            // wordToTokens(word: number): [number, number] | undefined
+
+            let word = cx.extract::<u32>(0)?;
+
+            let this = cx.this();
+            let guard = cx.lock();
+
+            let res = this.borrow(&guard)
+                .encoding.as_ref().expect("Uninitialized Encoding")
+                .word_to_tokens(word);
+
+            if let Some(tokens) = res {
+                Ok(neon_serde::to_value(&mut cx, &tokens)?)
+            } else {
+                Ok(cx.undefined().upcast())
+            }
+        }
+
+        method wordToChars(mut cx) {
+            // wordToChars(word: number): [number, number] | undefined
+
+            let word = cx.argument::<JsNumber>(0)?.value() as u32;
+
+            let this = cx.this();
+            let guard = cx.lock();
+
+            let res = this.borrow(&guard)
+                .encoding.as_ref().expect("Uninitialized Encoding")
+                .word_to_chars(word);
+
+            if let Some(offsets) = res {
+                Ok(neon_serde::to_value(&mut cx, &offsets)?)
+            } else {
+                Ok(cx.undefined().upcast())
+            }
+        }
+
+        method tokenToChars(mut cx) {
+            // tokenToChars(token: number): [number, number] | undefined
+
+            let token = cx.argument::<JsNumber>(0)?.value() as usize;
+
+            let this = cx.this();
+            let guard = cx.lock();
+
+            let res = this.borrow(&guard)
+                .encoding.as_ref().expect("Uninitialized Encoding")
+                .token_to_chars(token);
+
+            if let Some(offsets) = res {
+                Ok(neon_serde::to_value(&mut cx, &offsets)?)
+            } else {
+                Ok(cx.undefined().upcast())
+            }
+        }
+
+        method tokenToWord(mut cx) {
+            // tokenToWord(token: number): number | undefined
+
+            let token = cx.argument::<JsNumber>(0)?.value() as usize;
+
+            let this = cx.this();
+            let guard = cx.lock();
+            let index = this.borrow(&guard)
+                .encoding.as_ref().expect("Uninitialized Encoding")
+                .token_to_word(token);
+
+            if let Some(index) = index {
+                Ok(cx.number(index as f64).upcast())
+            } else {
+                Ok(cx.undefined().upcast())
+            }
+        }
+
+        method charToToken(mut cx) {
+            // charToToken(pos: number): number | undefined
+
+            let pos = cx.argument::<JsNumber>(0)?.value() as usize;
+
+            let this = cx.this();
+            let guard = cx.lock();
+            let index = this.borrow(&guard)
+                .encoding.as_ref().expect("Uninitialized Encoding")
+                .char_to_token(pos);
+
+            if let Some(index) = index {
+                Ok(cx.number(index as f64).upcast())
+            } else {
+                Ok(cx.undefined().upcast())
+            }
+        }
+
+        method charToWord(mut cx) {
+            // charToWord(pos: number): number | undefined
+
+            let pos = cx.argument::<JsNumber>(0)?.value() as usize;
+
+            let this = cx.this();
+            let guard = cx.lock();
+            let index = this.borrow(&guard)
+                .encoding.as_ref().expect("Uninitialized Encoding")
+                .char_to_word(pos);
+
+            if let Some(index) = index {
+                Ok(cx.number(index as f64).upcast())
             } else {
                 Ok(cx.undefined().upcast())
             }
@@ -155,49 +262,21 @@ declare_types! {
             //   padTypeId?: number = 0,
             //   padToken?: string = "[PAD]"
             // }
-
-            let length = cx.argument::<JsNumber>(0)?.value() as usize;
-            let mut direction = PaddingDirection::Right;
-            let mut pad_id = 0;
-            let mut pad_type_id = 0;
-            let mut pad_token = String::from("[PAD]");
-
-            let options = cx.argument_opt(1);
-            if let Some(options) = options {
-                if let Ok(options) = options.downcast::<JsObject>() {
-                    if let Ok(dir) = options.get(&mut cx, "direction") {
-                        if let Err(_) = dir.downcast::<JsUndefined>() {
-                            let dir = dir.downcast::<JsString>().or_throw(&mut cx)?.value();
-                            match &dir[..] {
-                                "right" => direction = PaddingDirection::Right,
-                                "left" => direction = PaddingDirection::Left,
-                                _ => return cx.throw_error("direction can be 'right' or 'left'"),
-                            }
-                        }
-                    }
-                    if let Ok(pid) = options.get(&mut cx, "padId") {
-                        if let Err(_) = pid.downcast::<JsUndefined>() {
-                            pad_id = pid.downcast::<JsNumber>().or_throw(&mut cx)?.value() as u32;
-                        }
-                    }
-                    if let Ok(pid) = options.get(&mut cx, "padTypeId") {
-                        if let Err(_) = pid.downcast::<JsUndefined>() {
-                            pad_type_id = pid.downcast::<JsNumber>().or_throw(&mut cx)?.value() as u32;
-                        }
-                    }
-                    if let Ok(token) = options.get(&mut cx, "padToken") {
-                        if let Err(_) = token.downcast::<JsUndefined>() {
-                            pad_token = token.downcast::<JsString>().or_throw(&mut cx)?.value();
-                        }
-                    }
-                }
-            }
+            let length = cx.extract::<usize>(0)?;
+            let params = cx.extract_opt::<PaddingParams>(1)?
+                .map_or_else(tk::PaddingParams::default, |p| p.0);
 
             let mut this = cx.this();
             let guard = cx.lock();
-            this.borrow_mut(&guard).encoding.execute_mut(|encoding| {
-                encoding.unwrap().pad(length, pad_id, pad_type_id, &pad_token, &direction);
-            });
+            this.borrow_mut(&guard)
+                .encoding.as_mut().expect("Uninitialized Encoding")
+                .pad(
+                    length,
+                    params.pad_id,
+                    params.pad_type_id,
+                    &params.pad_token,
+                    params.direction
+                );
 
             Ok(cx.undefined().upcast())
         }
@@ -205,17 +284,14 @@ declare_types! {
         method truncate(mut cx) {
             // truncate(length: number, stride: number = 0)
 
-            let length = cx.argument::<JsNumber>(0)?.value() as usize;
-            let mut stride = 0;
-            if let Some(args) = cx.argument_opt(1) {
-                stride = args.downcast::<JsNumber>().or_throw(&mut cx)?.value() as usize;
-            }
+            let length = cx.extract::<usize>(0)?;
+            let stride = cx.extract_opt::<usize>(1)?.unwrap_or(0);
 
             let mut this = cx.this();
             let guard = cx.lock();
-            this.borrow_mut(&guard).encoding.execute_mut(|encoding| {
-                encoding.unwrap().truncate(length, stride);
-            });
+            this.borrow_mut(&guard)
+                .encoding.as_mut().expect("Uninitialized Encoding")
+                .truncate(length, stride);
 
             Ok(cx.undefined().upcast())
         }

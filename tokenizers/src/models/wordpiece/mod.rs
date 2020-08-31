@@ -2,8 +2,9 @@
 //! model.
 
 use crate::models::bpe::BPE;
-use crate::tokenizer::{Model, Offsets, Result, Token};
+use crate::tokenizer::{Model, Result, Token};
 use std::{
+    borrow::Cow,
     collections::HashMap,
     fmt,
     fs::File,
@@ -12,6 +13,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod serialization;
 mod trainer;
 pub use trainer::*;
 
@@ -32,8 +34,12 @@ impl fmt::Display for Error {
     }
 }
 
+type Vocab = HashMap<String, u32>;
+type VocabR = HashMap<u32, String>;
+
 struct Config {
-    vocab: HashMap<String, u32>,
+    files: Option<String>,
+    vocab: Vocab,
     unk_token: String,
     continuing_subword_prefix: String,
     max_input_chars_per_word: usize,
@@ -48,6 +54,7 @@ impl Default for WordPieceBuilder {
     fn default() -> Self {
         Self {
             config: Config {
+                files: None,
                 vocab: HashMap::new(),
                 unk_token: String::from("[UNK]"),
                 continuing_subword_prefix: String::from("##"),
@@ -63,8 +70,14 @@ impl WordPieceBuilder {
         Self::default()
     }
 
+    /// Set the input files.
+    pub fn files(mut self, vocab: String) -> Self {
+        self.config.files = Some(vocab);
+        self
+    }
+
     /// Set the vocab (token -> ID) mapping.
-    pub fn vocab(mut self, vocab: HashMap<String, u32>) -> Self {
+    pub fn vocab(mut self, vocab: Vocab) -> Self {
         self.config.vocab = vocab;
         self
     }
@@ -88,32 +101,49 @@ impl WordPieceBuilder {
     }
 
     /// Contructs a `WordPiece` model that uses the `WordPieceBuilder`'s configuration.
-    pub fn build(self) -> WordPiece {
+    pub fn build(mut self) -> Result<WordPiece> {
+        if let Some(vocab) = self.config.files {
+            self.config.vocab = WordPiece::read_files(&vocab)?;
+        }
+
         let vocab_r = self
             .config
             .vocab
             .iter()
             .map(|(key, val)| (*val, key.to_owned()))
             .collect();
-        WordPiece {
+
+        Ok(WordPiece {
             vocab: self.config.vocab,
             vocab_r,
             unk_token: self.config.unk_token,
             continuing_subword_prefix: self.config.continuing_subword_prefix,
             max_input_chars_per_word: self.config.max_input_chars_per_word,
-        }
+        })
     }
 }
 
 /// A
 /// [WordPiece](https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/37842.pdf)
 /// model.
+#[derive(Clone, PartialEq)]
 pub struct WordPiece {
-    vocab: HashMap<String, u32>,
-    vocab_r: HashMap<u32, String>,
+    vocab: Vocab,
+    vocab_r: VocabR,
     unk_token: String,
     continuing_subword_prefix: String,
     max_input_chars_per_word: usize,
+}
+
+impl std::fmt::Debug for WordPiece {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
+        fmt.debug_struct("WordPiece")
+            .field("unk_token", &self.unk_token)
+            .field("continuing_subword_prefix", &self.continuing_subword_prefix)
+            .field("max_input_chars_per_word", &self.max_input_chars_per_word)
+            .field("vocab", &self.vocab.len())
+            .finish()
+    }
 }
 
 impl Default for WordPiece {
@@ -134,12 +164,8 @@ impl WordPiece {
         WordPieceBuilder::new()
     }
 
-    /// Initialize a `WordPiece` model from a vocab mapping file.
-    pub fn from_files(
-        vocab: &str,
-        unk_token: String,
-        max_input_chars_per_word: Option<usize>,
-    ) -> std::io::Result<Self> {
+    /// Read the given files to extract the vocab
+    pub fn read_files(vocab: &str) -> Result<Vocab> {
         let file = File::open(vocab)?;
         let file = BufReader::new(file);
 
@@ -149,16 +175,20 @@ impl WordPiece {
             vocab.insert(line.trim_end().to_owned(), index as u32);
         }
 
-        let mut builder = Self::builder().vocab(vocab).unk_token(unk_token);
-        if let Some(max_chars) = max_input_chars_per_word {
-            builder = builder.max_input_chars_per_word(max_chars);
-        }
-        Ok(builder.build())
+        Ok(vocab)
+    }
+
+    /// Initialize a `WordPiece` model from a vocab mapping file.
+    pub fn from_files(vocab: &str) -> WordPieceBuilder {
+        WordPiece::builder().files(vocab.to_owned())
     }
 
     /// Create a `WordPiece` model from a `BPE` model.
     pub fn from_bpe(bpe: &BPE) -> Self {
-        let mut wp = Self::builder().vocab(bpe.get_vocab().clone()).build();
+        let mut wp = Self::builder()
+            .vocab(bpe.get_vocab().clone())
+            .build()
+            .unwrap();
         if let Some(unk) = bpe.get_unk_token() {
             wp.unk_token = unk.to_owned();
         }
@@ -170,89 +200,91 @@ impl WordPiece {
 }
 
 impl Model for WordPiece {
+    fn get_vocab(&self) -> &HashMap<String, u32> {
+        &self.vocab
+    }
+
     fn get_vocab_size(&self) -> usize {
         self.vocab.len()
     }
 
-    fn tokenize(&self, sentence: Vec<(String, Offsets)>) -> Result<Vec<Token>> {
-        let mut output_tokens = vec![];
-
-        for (token, initial_offsets) in sentence {
-            let char_len = token.chars().count();
-            if char_len > self.max_input_chars_per_word {
-                output_tokens.push(Token {
-                    value: self.unk_token.clone(),
-                    id: *self
-                        .vocab
-                        .get(&self.unk_token)
-                        .ok_or(Error::MissingUnkToken)?,
-                    offsets: initial_offsets,
-                });
-                continue;
-            }
-
-            let mut is_bad = false;
-            let mut start = 0;
-            let mut sub_tokens: Vec<Token> = vec![];
-            let chars = token.chars().collect::<Vec<_>>();
-
-            while start < chars.len() {
-                let mut end = chars.len();
-                let mut cur_str = None;
-
-                while start < end {
-                    let mut substr = chars[start..end].iter().collect::<String>();
-                    if start > 0 {
-                        substr = format!("{}{}", self.continuing_subword_prefix, substr);
-                    }
-                    if self.vocab.contains_key(&substr) {
-                        cur_str = Some(Token {
-                            id: self.vocab[&substr],
-                            value: substr,
-                            offsets: (initial_offsets.0 + start, initial_offsets.0 + end),
-                        });
-                        break;
-                    }
-                    end -= 1;
-                }
-
-                if cur_str.is_none() {
-                    is_bad = true;
-                    break;
-                }
-
-                sub_tokens.push(cur_str.unwrap());
-                start = end;
-            }
-
-            if is_bad {
-                output_tokens.push(Token {
-                    value: self.unk_token.clone(),
-                    id: *self
-                        .vocab
-                        .get(&self.unk_token)
-                        .ok_or(Error::MissingUnkToken)?,
-                    offsets: initial_offsets,
-                });
-            } else {
-                output_tokens.extend(sub_tokens);
-            }
+    fn tokenize(&self, sequence: &str) -> Result<Vec<Token>> {
+        let char_len = sequence.chars().count();
+        if char_len > self.max_input_chars_per_word {
+            return Ok(vec![Token {
+                value: self.unk_token.clone(),
+                id: *self
+                    .vocab
+                    .get(&self.unk_token)
+                    .ok_or(Error::MissingUnkToken)?,
+                offsets: (0, sequence.len()),
+            }]);
         }
 
-        Ok(output_tokens)
+        let mut is_bad = false;
+        let mut start = 0;
+        let mut sub_tokens: Vec<Token> = vec![];
+
+        while start < sequence.len() {
+            let mut end = sequence.len();
+            let mut cur_str = None;
+
+            while start < end {
+                let mut substr: Cow<str> = Cow::Borrowed(&sequence[start..end]);
+
+                if start > 0 {
+                    substr = Cow::Owned(format!("{}{}", self.continuing_subword_prefix, substr));
+                }
+                if self.vocab.contains_key(substr.as_ref()) {
+                    cur_str = Some(Token {
+                        id: self.vocab[substr.as_ref()],
+                        value: substr.to_string(),
+                        offsets: (start, end),
+                    });
+                    break;
+                }
+                end -= substr.chars().last().map_or(1, |c| c.len_utf8());
+            }
+
+            if cur_str.is_none() {
+                is_bad = true;
+                break;
+            }
+
+            sub_tokens.push(cur_str.unwrap());
+            start = end;
+        }
+
+        if is_bad {
+            Ok(vec![Token {
+                value: self.unk_token.clone(),
+                id: *self
+                    .vocab
+                    .get(&self.unk_token)
+                    .ok_or(Error::MissingUnkToken)?,
+                offsets: (0, sequence.len()),
+            }])
+        } else {
+            Ok(sub_tokens)
+        }
     }
 
     fn token_to_id(&self, token: &str) -> Option<u32> {
         self.vocab.get(token).copied()
     }
 
-    fn id_to_token(&self, id: u32) -> Option<String> {
-        self.vocab_r.get(&id).cloned()
+    fn id_to_token(&self, id: u32) -> Option<&str> {
+        self.vocab_r.get(&id).map(String::as_ref)
     }
 
-    fn save(&self, folder: &Path, name: &str) -> Result<Vec<PathBuf>> {
+    fn save(&self, folder: &Path, name: Option<&str>) -> Result<Vec<PathBuf>> {
+        let vocab_file_name = match name {
+            Some(name) => format!("{}-vocab.txt", name),
+            None => "vocab.txt".to_string(),
+        };
+
         // Write vocab.txt
-        let vocab_path: PathBuf = [folder, Path::new(&format!("{}-vocab.txt", name))]
+        let vocab_path: PathBuf = [folder, Path::new(vocab_file_name.as_str())]
             .iter()
             .collect();
         let mut vocab_file = File::create(&vocab_path)?;
@@ -261,8 +293,7 @@ impl Model for WordPiece {
         vocab_file.write_all(
             &vocab
                 .into_iter()
-                .map(|(token, _)| format!("{}\n", token).as_bytes().to_owned())
-                .flatten()
+                .flat_map(|(token, _)| format!("{}\n", token).as_bytes().to_owned())
                 .collect::<Vec<_>>()[..],
         )?;
 

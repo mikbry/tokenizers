@@ -1,7 +1,8 @@
-use super::{Cache, Error, Pair, WithFirstLastIterator, Word, DEFAULT_CACHE_CAPACITY};
-use crate::tokenizer::{Model, Offsets, Result, Token};
-use rand::{thread_rng, Rng};
+use super::{super::OrderedVocabIter, Cache, Error, Pair, Word, DEFAULT_CACHE_CAPACITY};
+use crate::tokenizer::{Model, Result, Token};
+use crate::utils::iter::ResultShunt;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::{
     collections::HashMap,
     fs::File,
@@ -10,9 +11,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
+type Vocab = HashMap<String, u32>;
+type VocabR = HashMap<u32, String>;
+type Merges = HashMap<Pair, (u32, u32)>;
+
 struct Config {
-    vocab: HashMap<String, u32>,
-    merges: HashMap<Pair, (u32, u32)>,
+    files: Option<(String, String)>,
+    vocab: Vocab,
+    merges: Merges,
     cache_capacity: usize,
     dropout: Option<f32>,
     unk_token: Option<String>,
@@ -29,6 +35,7 @@ impl Default for BpeBuilder {
     fn default() -> Self {
         Self {
             config: Config {
+                files: None,
                 vocab: HashMap::new(),
                 merges: HashMap::new(),
                 cache_capacity: DEFAULT_CACHE_CAPACITY,
@@ -47,12 +54,14 @@ impl BpeBuilder {
         Self::default()
     }
 
+    /// Set the input files.
+    pub fn files(mut self, vocab: String, merges: String) -> Self {
+        self.config.files = Some((vocab, merges));
+        self
+    }
+
     /// Set the vocab (token -> ID) and merges mappings.
-    pub fn vocab_and_merges(
-        mut self,
-        vocab: HashMap<String, u32>,
-        merges: HashMap<Pair, (u32, u32)>,
-    ) -> Self {
+    pub fn vocab_and_merges(mut self, vocab: Vocab, merges: Merges) -> Self {
         self.config.vocab = vocab;
         self.config.merges = merges;
         self
@@ -89,12 +98,19 @@ impl BpeBuilder {
     }
 
     /// Returns a `BPE` model that uses the `BpeBuilder`'s configuration.
-    pub fn build(self) -> Result<BPE> {
+    pub fn build(mut self) -> Result<BPE> {
         // Validate dropout.
         if let Some(p) = self.config.dropout {
             if p <= 0.0 || p > 1.0 {
                 return Err(Error::InvalidDropout.into());
             }
+        }
+
+        // Read files if necessary
+        if let Some((vocab, merges)) = self.config.files {
+            let (v, m) = BPE::read_files(&vocab, &merges)?;
+            self.config.vocab = v;
+            self.config.merges = m;
         }
 
         let vocab_r = self
@@ -122,24 +138,38 @@ impl BpeBuilder {
 }
 
 /// A [Byte Pair Encoding](https://www.aclweb.org/anthology/P16-1162/) model.
+#[derive(PartialEq)]
 pub struct BPE {
     /// The vocabulary assigns a number to each token.
-    vocab: HashMap<String, u32>,
+    pub(crate) vocab: Vocab,
     /// Reversed vocabulary, to rebuild sentences.
-    vocab_r: HashMap<u32, String>,
+    pub(crate) vocab_r: VocabR,
     /// Contains the mapping between Pairs and their (rank, new_id).
-    merges: HashMap<Pair, (u32, u32)>,
+    pub(crate) merges: Merges,
     /// Contains the cache for optimizing the encoding step.
     cache: Option<Cache<String, Word>>,
     /// Dropout probability for merges. 0 = no dropout is the default. At 1.0, tokenization will
     /// perform no merges, so the result will just be characters.
-    dropout: Option<f32>,
+    pub(super) dropout: Option<f32>,
     /// The unknown token to be used when we encounter an unknown char
-    unk_token: Option<String>,
+    pub(super) unk_token: Option<String>,
     /// An optional prefix to use on any subword that exist only behind another one
-    continuing_subword_prefix: Option<String>,
+    pub(super) continuing_subword_prefix: Option<String>,
     /// An optional suffix to caracterize and end-of-word subword
-    end_of_word_suffix: Option<String>,
+    pub(super) end_of_word_suffix: Option<String>,
+}
+
+impl std::fmt::Debug for BPE {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
+        fmt.debug_struct("BPE")
+            .field("dropout", &self.dropout)
+            .field("unk_token", &self.unk_token)
+            .field("continuing_subword_prefix", &self.continuing_subword_prefix)
+            .field("end_of_word_suffix", &self.end_of_word_suffix)
+            .field("vocab", &self.vocab.len())
+            .field("merges", &self.merges.len())
+            .finish()
+    }
 }
 
 impl Default for BPE {
@@ -152,10 +182,7 @@ impl Clone for BPE {
     // `Clone` can't be derive because it's not implemented for `Cache`.
     // To keep things simple when we clone, the new BPE will start with a fresh cache.
     fn clone(&self) -> Self {
-        let fresh_cache = match self.cache {
-            Some(ref cache) => Some(cache.fresh()),
-            None => None,
-        };
+        let fresh_cache = self.cache.as_ref().map(|cache| cache.fresh());
         Self {
             vocab: self.vocab.clone(),
             vocab_r: self.vocab_r.clone(),
@@ -169,6 +196,39 @@ impl Clone for BPE {
     }
 }
 
+/// Converts the merges strings (for example from `merges.txt` file) with the format
+/// "{pair_a} {pair_b}" into the format expected by the BPE struct
+pub(crate) fn convert_merges_to_hashmap<I: Iterator<Item = String>>(
+    iter: I,
+    vocab: &Vocab,
+) -> Result<Merges> {
+    let mut merges = HashMap::new();
+
+    let lines = iter.filter(|l| !l.starts_with("#version"));
+    for (rank, line) in lines.enumerate() {
+        let parts = line.split(' ').collect::<Vec<_>>();
+        if parts.len() != 2 {
+            return Err(Error::BadMerges(rank + 1).into());
+        }
+
+        let a = vocab
+            .get(parts[0])
+            .ok_or_else(|| Error::MergeTokenOutOfVocabulary(parts[0].to_owned()))?;
+        let b = vocab
+            .get(parts[1])
+            .ok_or_else(|| Error::MergeTokenOutOfVocabulary(parts[1].to_owned()))?;
+        let pair = (*a, *b);
+        let new_token = format!("{}{}", parts[0], parts[1]);
+        let new_id = vocab
+            .get(&new_token)
+            .ok_or(Error::MergeTokenOutOfVocabulary(new_token))?;
+
+        merges.insert(pair, (rank as u32, *new_id));
+    }
+
+    Ok(merges)
+}
+
 impl BPE {
     /// Initialize a `BpeBuilder`.
     pub fn builder() -> BpeBuilder {
@@ -176,15 +236,20 @@ impl BPE {
     }
 
     /// Create a new BPE model with the given vocab and merges.
-    pub fn new(vocab: HashMap<String, u32>, merges: HashMap<Pair, (u32, u32)>) -> Self {
+    pub fn new(vocab: Vocab, merges: Merges) -> Self {
         Self::builder()
             .vocab_and_merges(vocab, merges)
             .build()
             .unwrap()
     }
 
-    /// Initialize a BPE model from vocab and merges file.
-    pub fn from_files(vocab: &str, merges: &str) -> Result<BpeBuilder> {
+    /// Initialize a BpeBuilder model from vocab and merges files
+    pub fn from_files(vocab: &str, merges: &str) -> BpeBuilder {
+        BPE::builder().files(vocab.to_owned(), merges.to_owned())
+    }
+
+    /// Read the given files to extract the vocab and merges
+    pub fn read_files(vocab: &str, merges: &str) -> Result<(Vocab, Merges)> {
         // Read vocab.json
         let vocab_file = File::open(vocab)?;
         let mut vocab_file = BufReader::new(vocab_file);
@@ -208,35 +273,11 @@ impl BPE {
         // Read merges file
         let merge_file = File::open(merges)?;
         let merge_file = BufReader::new(merge_file);
-        let mut merges = HashMap::<Pair, (u32, u32)>::new();
-        for (rank, line) in merge_file.lines().enumerate() {
-            let line = line?;
-            if line.starts_with("#version") {
-                // Skip line with: #version
-                continue;
-            }
+        let merges = ResultShunt::process(merge_file.lines(), |iter| {
+            convert_merges_to_hashmap(iter, &vocab)
+        })??;
 
-            let parts = line.split(' ').collect::<Vec<_>>();
-            if parts.len() != 2 {
-                return Err(Error::BadMerges(rank + 1).into());
-            }
-
-            let a = vocab
-                .get(parts[0])
-                .ok_or_else(|| Error::MergeTokenOutOfVocabulary(parts[0].to_owned()))?;
-            let b = vocab
-                .get(parts[1])
-                .ok_or_else(|| Error::MergeTokenOutOfVocabulary(parts[1].to_owned()))?;
-            let pair = (*a, *b);
-            let new_token = format!("{}{}", parts[0], parts[1]);
-            let new_id = vocab
-                .get(&new_token)
-                .ok_or(Error::MergeTokenOutOfVocabulary(new_token))?;
-
-            merges.insert(pair, (rank as u32, *new_id));
-        }
-
-        Ok(BPE::builder().vocab_and_merges(vocab, merges))
+        Ok((vocab, merges))
     }
 
     /// Reset the cache.
@@ -246,7 +287,7 @@ impl BPE {
         }
     }
 
-    pub fn get_vocab(&self) -> &HashMap<String, u32> {
+    pub fn get_vocab(&self) -> &Vocab {
         &self.vocab
     }
 
@@ -259,178 +300,116 @@ impl BPE {
     }
 
     fn merge_word(&self, w: &str) -> Result<Word> {
-        let mut word = Word::new();
-        for (is_first, is_last, c) in w.chars().with_first_and_last() {
-            let mut s = c.to_string();
-
-            // Add the `continuing_subword_prefix` if relevant
-            if !is_first {
-                if let Some(prefix) = &self.continuing_subword_prefix {
-                    s = format!("{}{}", prefix, s);
+        let mut indices = w.char_indices().map(|(idx, _)| idx).peekable();
+        let mut word = Word::with_capacity(w.len());
+        while let Some(i) = indices.next() {
+            let (s, byte_len) = if let Some(&end) = indices.peek() {
+                match (i, self.continuing_subword_prefix.as_ref()) {
+                    (0, Some(prefix)) => (
+                        Cow::Owned(format!("{}{}", prefix, &w[i..end])),
+                        (i..end).len(),
+                    ),
+                    _ => (Cow::Borrowed(&w[i..end]), (i..end).len()),
                 }
-            }
-            // Add the `end_of_word_suffix` if relevant
-            if is_last {
-                if let Some(suffix) = &self.end_of_word_suffix {
-                    s = format!("{}{}", s, suffix);
-                }
-            }
+            } else {
+                (
+                    self.end_of_word_suffix
+                        .as_ref()
+                        .map(|suffix| format!("{}{}", &w[i..], suffix).into())
+                        .unwrap_or_else(|| Cow::Borrowed(&w[i..])),
+                    w[i..].len(),
+                )
+            };
 
-            if let Some(id) = self.vocab.get(&s) {
-                word.add(*id);
+            if let Some(id) = self.vocab.get(s.as_ref()) {
+                word.add(*id, byte_len);
             } else if let Some(unk) = &self.unk_token {
                 let unk_id = self
                     .vocab
                     .get(unk)
                     .ok_or_else(|| Error::UnkTokenOutOfVocabulary(unk.to_owned()))?;
                 // Handle UNK token
-                word.add(*unk_id);
+                word.add(*unk_id, byte_len);
             }
         }
 
-        loop {
-            if word.get_chars().len() < 2 {
-                break;
-            }
-
-            let ((rank, new_id), pair) = word
-                .get_chars()
-                .windows(2)
-                .map(|window| {
-                    let pair = (window[0], window[1]);
-                    let rank = self
-                        .merges
-                        .get(&pair)
-                        .map(|rank| {
-                            if let Some(dropout) = self.dropout {
-                                // With probability `dropout` we'll ignore this merge.
-                                if thread_rng().gen::<f32>() < dropout {
-                                    &(std::u32::MAX, std::u32::MAX)
-                                } else {
-                                    rank
-                                }
-                            } else {
-                                rank
-                            }
-                        })
-                        .unwrap_or(&(std::u32::MAX, std::u32::MAX));
-                    (rank, pair)
-                })
-                .min()
-                .unwrap();
-
-            if *rank == std::u32::MAX {
-                // We are done merging this word
-                break;
-            }
-
-            // Let's merge
-            word.merge(pair.0, pair.1, *new_id);
-        }
+        word.merge_all(&self.merges, self.dropout);
 
         Ok(word)
     }
 
-    fn word_to_tokens(&self, word: &Word, initial_offsets: &(usize, usize)) -> Vec<Token> {
-        word.get_chars()
-            .iter()
-            .zip(word.get_offsets())
-            .map(|(id, offsets)| {
-                Token::new(
-                    *id,
-                    self.vocab_r[id].clone(),
-                    (initial_offsets.0 + offsets.0, initial_offsets.0 + offsets.1),
-                )
-            })
-            .collect::<Vec<_>>()
+    fn word_to_tokens<'a, 'b: 'a>(&'a self, word: &'b Word) -> impl Iterator<Item = Token> + 'a {
+        word.get_chars_iter()
+            .zip(word.get_offsets_iter())
+            .map(move |(id, offsets)| Token::new(id, self.vocab_r[&id].clone(), offsets))
+    }
+
+    fn tokenize_with_cache(&self, sequence: &str) -> Result<Vec<Token>> {
+        if let Some(ref hit) = self.cache.as_ref().and_then(|c| c.get(sequence)) {
+            Ok(self.word_to_tokens(hit).collect())
+        } else {
+            let word = self.merge_word(sequence)?;
+            let ret = self.word_to_tokens(&word).collect();
+            if let Some(ref cache) = self.cache {
+                cache.set(sequence.to_owned(), word);
+            }
+            Ok(ret)
+        }
     }
 }
 
 impl Model for BPE {
+    fn get_vocab(&self) -> &HashMap<String, u32> {
+        &self.vocab
+    }
+
     fn get_vocab_size(&self) -> usize {
         self.vocab.len()
     }
 
-    fn tokenize(&self, sentence: Vec<(String, Offsets)>) -> Result<Vec<Token>> {
-        if sentence.is_empty() {
+    fn tokenize(&self, sequence: &str) -> Result<Vec<Token>> {
+        if sequence.is_empty() {
             return Ok(vec![]);
         }
 
-        let mut encoded: Vec<Token> = Vec::with_capacity(sentence.len());
-        let mut cached_words = match self.dropout {
-            None => match self.cache {
-                Some(ref cache) => cache.get_values(sentence.iter().map(|(s, _)| s.clone())),
-                None => None,
-            },
-            Some(_) => None, // If using dropout we don't want to use the cache.
-        };
-        let mut should_update_cache = false;
-
-        for (i, (w, initial_offsets)) in sentence.iter().enumerate() {
-            let tokens = match cached_words {
-                None => {
-                    // Not using cache since we're using dropout.
-                    let word = self.merge_word(&w)?;
-                    self.word_to_tokens(&word, initial_offsets)
-                }
-                Some(ref mut cache) => {
-                    match cache[i].as_ref() {
-                        None => {
-                            // No cache hit, so re-compute merges.
-                            let word = self.merge_word(&w)?;
-                            let tokens = self.word_to_tokens(&word, initial_offsets);
-                            // Add to cache.
-                            cache[i] = Some(word);
-                            should_update_cache = true;
-                            tokens
-                        }
-                        Some(word) => {
-                            let tokens = self.word_to_tokens(word, initial_offsets);
-                            // Remove this entry so we don't needlesly try to update
-                            // it in the cache below.
-                            cache[i] = None;
-                            tokens
-                        }
-                    }
-                }
-            };
-
-            encoded.extend(tokens);
+        if self.dropout.is_none() {
+            self.tokenize_with_cache(sequence)
+        } else {
+            let word = self.merge_word(sequence)?;
+            Ok(self.word_to_tokens(&word).collect())
         }
-
-        // Try updating the cache if we need to.
-        if let Some(cache) = cached_words {
-            if should_update_cache {
-                let keys_iter = sentence.into_iter().map(|(s, _)| s);
-                self.cache
-                    .as_ref()
-                    .unwrap()
-                    .set_values(keys_iter, cache.into_iter());
-            }
-        }
-
-        Ok(encoded)
     }
 
     fn token_to_id(&self, token: &str) -> Option<u32> {
         self.vocab.get(token).copied()
     }
 
-    fn id_to_token(&self, id: u32) -> Option<String> {
-        self.vocab_r.get(&id).cloned()
+    fn id_to_token(&self, id: u32) -> Option<&str> {
+        self.vocab_r.get(&id).map(String::as_ref)
     }
 
-    fn save(&self, folder: &Path, name: &str) -> Result<Vec<PathBuf>> {
+    fn save(&self, folder: &Path, name: Option<&str>) -> Result<Vec<PathBuf>> {
+        let vocab_file_name = match name {
+            Some(name) => format!("{}-vocab.json", name),
+            None => "vocab.json".to_string(),
+        };
+
         // Write vocab.json
-        let vocab_path: PathBuf = [folder, Path::new(&format!("{}-vocab.json", name))]
+        let vocab_path: PathBuf = [folder, Path::new(vocab_file_name.as_str())]
             .iter()
             .collect();
         let mut vocab_file = File::create(&vocab_path)?;
-        let serialized = serde_json::to_string(&self.vocab)?;
+        let order_vocab_iter = OrderedVocabIter::new(&self.vocab_r);
+        let serialized = serde_json::to_string(&order_vocab_iter)?;
         vocab_file.write_all(&serialized.as_bytes())?;
 
         // Write merges.txt
-        let merges_path: PathBuf = [folder, Path::new(&format!("{}-merges.txt", name))]
+        let merges_file_name = match name {
+            Some(name) => format!("{}-merges.txt", name),
+            None => "merges.txt".to_string(),
+        };
+
+        let merges_path: PathBuf = [folder, Path::new(merges_file_name.as_str())]
             .iter()
             .collect();
         let mut merges_file = File::create(&merges_path)?;
@@ -444,10 +423,9 @@ impl Model for BPE {
         merges_file.write_all(
             &merges
                 .into_iter()
-                .map(|(pair, _)| {
+                .flat_map(|(pair, _)| {
                     format!("{} {}\n", self.vocab_r[&pair.0], self.vocab_r[&pair.1]).into_bytes()
                 })
-                .flatten()
                 .collect::<Vec<_>>()[..],
         )?;
 
@@ -461,12 +439,28 @@ mod tests {
     use tempfile::NamedTempFile;
 
     #[test]
+    fn test_ordered_vocab_iter() {
+        let vocab_r: VocabR = [
+            (0, "a".into()),
+            (1, "b".into()),
+            (2, "c".into()),
+            (3, "ab".into()),
+        ]
+        .iter()
+        .cloned()
+        .collect();
+        let order_vocab_iter = OrderedVocabIter::new(&vocab_r);
+        let serialized = serde_json::to_string(&order_vocab_iter).unwrap();
+        assert_eq!(serialized, "{\"a\":0,\"b\":1,\"c\":2,\"ab\":3}");
+    }
+
+    #[test]
     // Test tokenization. With dropout set to 0 tokenization is deterministic,
     // so we know exactly what the result should be.
     //
     // To test this, we'll build a simple model to tokenize the word 'unrelated'.
     fn test_tokenize_with_and_without_dropout() {
-        let vocab: HashMap<String, u32> = [
+        let vocab: Vocab = [
             ("u".into(), 0),
             ("n".into(), 1),
             ("r".into(), 2),
@@ -487,7 +481,7 @@ mod tests {
         .iter()
         .cloned()
         .collect();
-        let merges: HashMap<Pair, (u32, u32)> = [
+        let merges: Merges = [
             ((vocab["r"], vocab["e"]), (1u32, vocab["re"])), // 'r-e' -> 're'
             ((vocab["a"], vocab["t"]), (2u32, vocab["at"])), // 'a-t' -> 'at'
             ((vocab["e"], vocab["d"]), (3u32, vocab["ed"])), // 'e-d' -> 'ed'
@@ -502,15 +496,13 @@ mod tests {
         .collect();
         let mut bpe = BPE::new(vocab, merges);
 
-        let sentence: Vec<(String, Offsets)> = vec![("unrelated".into(), (0, 9))];
-
         // With no dropout:
-        let tokens = bpe.tokenize(sentence.clone()).unwrap();
+        let tokens = bpe.tokenize("unrelated").unwrap();
         assert_eq!(tokens, vec![Token::new(15u32, "unrelated".into(), (0, 9))]);
 
         // Now set dropout to 1.0. Result should be no merges performed.
         bpe.dropout = Some(1.0);
-        let tokens = bpe.tokenize(sentence.clone()).unwrap();
+        let tokens = bpe.tokenize("unrelated").unwrap();
         assert_eq!(
             tokens,
             vec![
@@ -528,7 +520,7 @@ mod tests {
 
         // Now try with dropout between 0 and 1.
         bpe.dropout = Some(0.5);
-        let tokens = bpe.tokenize(sentence).unwrap();
+        let tokens = bpe.tokenize("unrelated").unwrap();
         assert!(!tokens.is_empty() && tokens.len() <= 9);
     }
 
@@ -538,26 +530,22 @@ mod tests {
         // Set up vocab file.
         let mut vocab_file = NamedTempFile::new().unwrap();
         vocab_file
-            .write_all("{\"a\": 0, \"b\": 1, \"c\": 2, \"ab\": 3}".as_bytes())
+            .write_all(b"{\"a\": 0, \"b\": 1, \"c\": 2, \"ab\": 3}")
             .unwrap();
 
         // Set up merges file.
         let mut merges_file = NamedTempFile::new().unwrap();
-        merges_file
-            .write_all("#version: 0.2\na b".as_bytes())
-            .unwrap();
+        merges_file.write_all(b"#version: 0.2\na b").unwrap();
 
         // Make sure we can instantiate a BPE model from the files.
-        let result = BPE::from_files(
+        let builder = BPE::from_files(
             vocab_file.path().to_str().unwrap(),
             merges_file.path().to_str().unwrap(),
         );
-        assert!(result.is_ok());
-
-        let bpe = result.unwrap().build().unwrap();
+        let bpe = builder.build().unwrap();
 
         // Check merges.
-        assert_eq!(bpe.merges.get(&(0u32, 1u32)).unwrap(), &(1u32, 3u32));
+        assert_eq!(bpe.merges.get(&(0, 1)).unwrap(), &(0u32, 3u32));
 
         // Check vocab.
         assert_eq!(bpe.vocab.get("a").unwrap(), &0u32);
@@ -572,20 +560,20 @@ mod tests {
         // Set up vocab file.
         let mut vocab_file = NamedTempFile::new().unwrap();
         vocab_file
-            .write_all("{\"a\": 0, \"b\": 1, \"c\": 2, \"ab\": 3}".as_bytes())
+            .write_all(b"{\"a\": 0, \"b\": 1, \"c\": 2, \"ab\": 3}")
             .unwrap();
 
         // Set up merges file.
         let mut merges_file = NamedTempFile::new().unwrap();
-        merges_file
-            .write_all("#version: 0.2\na b\na d".as_bytes())
-            .unwrap();
+        merges_file.write_all(b"#version: 0.2\na b\na d").unwrap();
 
         // Ensure the result of BPE::from_files is a MergeTokenOutOfVocabulary error.
         match BPE::from_files(
             vocab_file.path().to_str().unwrap(),
             merges_file.path().to_str().unwrap(),
-        ) {
+        )
+        .build()
+        {
             Ok(_) => unreachable!(),
             Err(err) => match err.downcast_ref::<Error>() {
                 Some(Error::MergeTokenOutOfVocabulary(token)) => {
@@ -608,18 +596,18 @@ mod tests {
 
         // Set up merges file with a bad line.
         let mut merges_file = NamedTempFile::new().unwrap();
-        merges_file
-            .write_all("#version: 0.2\na b\nc".as_bytes())
-            .unwrap();
+        merges_file.write_all(b"#version: 0.2\na b\nc").unwrap();
 
         // Ensure the result of BPE::from_files is a BadMerges error.
         match BPE::from_files(
             vocab_file.path().to_str().unwrap(),
             merges_file.path().to_str().unwrap(),
-        ) {
+        )
+        .build()
+        {
             Ok(_) => unreachable!(),
             Err(err) => match err.downcast_ref::<Error>() {
-                Some(Error::BadMerges(line)) => assert_eq!(*line, 3usize),
+                Some(Error::BadMerges(line)) => assert_eq!(*line, 2),
                 _ => unreachable!(),
             },
         }

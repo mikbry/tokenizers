@@ -1,75 +1,80 @@
-use crate::tokenizer::{Offsets, PreTokenizer, Result};
+use crate::tokenizer::{PreTokenizedString, PreTokenizer, Result, SplitDelimiterBehavior};
+use unicode_categories::UnicodeCategories;
 
-/// Split the given string as the `should_split` predicate dictates. Keep track of the offsets
-fn split_on<F: Fn(&char) -> bool>(
-    s: &str,
-    should_split: F,
-    include_split_token: bool,
-) -> Vec<(String, Offsets)> {
-    let mut words: Vec<(String, Offsets)> = vec![];
-    let mut offset = 0;
-    let mut word = Vec::with_capacity(50);
-    s.chars().for_each(|c| {
-        if should_split(&c) {
-            if !word.is_empty() {
-                let offsets = (offset - word.len(), offset);
-                words.push((word.drain(0..).collect::<String>(), offsets));
-            }
-            if include_split_token {
-                words.push((c.to_string(), (offset, offset + 1)));
-            }
-        } else if !should_split(&c) {
-            word.push(c);
-        }
-        offset += 1;
-    });
-    // Don't forget the potential last word
-    if !word.is_empty() {
-        let offsets = (offset - word.len(), offset);
-        words.push((word.drain(0..).collect::<String>(), offsets));
-    }
-
-    words
+fn is_bert_punc(x: char) -> bool {
+    char::is_ascii_punctuation(&x) || x.is_punctuation()
 }
 
+#[derive(Copy, Clone, Debug)]
 pub struct BertPreTokenizer;
+impl_serde_unit_struct!(BertVisitor, BertPreTokenizer);
 
 impl PreTokenizer for BertPreTokenizer {
-    fn pre_tokenize(&self, s: &str) -> Result<Vec<(String, Offsets)>> {
-        let mut split_tokens = vec![];
-        for (token, offsets) in split_on(&s, |c| char::is_whitespace(*c), false) {
-            split_tokens.extend(
-                split_on(&token, char::is_ascii_punctuation, true)
-                    .into_iter()
-                    .map(|(tok, off)| (tok, (off.0 + offsets.0, off.1 + offsets.0))),
-            );
-        }
-        Ok(split_tokens)
+    fn pre_tokenize(&self, pretokenized: &mut PreTokenizedString) -> Result<()> {
+        pretokenized.split(|_, s| s.split(char::is_whitespace, SplitDelimiterBehavior::Removed))?;
+        pretokenized.split(|_, s| s.split(is_bert_punc, SplitDelimiterBehavior::Isolated))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{NormalizedString, OffsetReferential};
 
     #[test]
     fn basic() {
         let pretok = BertPreTokenizer;
-        let res = pretok
-            .pre_tokenize("Hey friend!     How are you?!?")
-            .unwrap();
+        let mut pretokenized: PreTokenizedString = "Hey friend!     How are you?!?".into();
+        pretok.pre_tokenize(&mut pretokenized).unwrap();
         assert_eq!(
-            &res,
-            &[
-                ("Hey".into(), (0, 3)),
-                ("friend".into(), (4, 10)),
-                ("!".into(), (10, 11)),
-                ("How".into(), (16, 19)),
-                ("are".into(), (20, 23)),
-                ("you".into(), (24, 27)),
-                ("?".into(), (27, 28)),
-                ("!".into(), (28, 29)),
-                ("?".into(), (29, 30)),
+            pretokenized
+                .get_splits(OffsetReferential::Original)
+                .into_iter()
+                .map(|(s, o, _)| (s, o))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Hey", (0, 3)),
+                ("friend", (4, 10)),
+                ("!", (10, 11)),
+                ("How", (16, 19)),
+                ("are", (20, 23)),
+                ("you", (24, 27)),
+                ("?", (27, 28)),
+                ("!", (28, 29)),
+                ("?", (29, 30)),
+            ]
+        );
+    }
+
+    #[test]
+    fn chinese_chars() {
+        let mut n = NormalizedString::from("野口里佳 Noguchi Rika");
+        n.transform(
+            n.get().to_owned().chars().flat_map(|c| {
+                if (c as usize) > 0x4E00 {
+                    vec![(' ', 0), (c, 1), (' ', 1)]
+                } else {
+                    vec![(c, 0)]
+                }
+            }),
+            0,
+        );
+        let mut pretokenized = n.into();
+        let pretok = BertPreTokenizer;
+        pretok.pre_tokenize(&mut pretokenized).unwrap();
+        assert_eq!(
+            pretokenized
+                .get_splits(OffsetReferential::Original)
+                .into_iter()
+                .map(|(s, o, _)| (s, o))
+                .collect::<Vec<_>>(),
+            vec![
+                ("野", (0, 3)),
+                ("口", (3, 6)),
+                ("里", (6, 9)),
+                ("佳", (9, 12)),
+                ("Noguchi", (13, 20)),
+                ("Rika", (21, 25))
             ]
         );
     }

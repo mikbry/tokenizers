@@ -1,20 +1,32 @@
 extern crate tokenizers as tk;
 
-use crate::utils::Container;
+use crate::extraction::*;
 use neon::prelude::*;
+use std::sync::Arc;
+
+use tk::decoders::DecoderWrapper;
 
 /// Decoder
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Decoder {
-    pub decoder: Container<dyn tk::tokenizer::Decoder + Sync>,
+    #[serde(flatten)]
+    pub decoder: Option<Arc<DecoderWrapper>>,
+}
+
+impl tk::Decoder for Decoder {
+    fn decode(&self, tokens: Vec<String>) -> tk::Result<String> {
+        self.decoder
+            .as_ref()
+            .ok_or("Uninitialized Decoder")?
+            .decode(tokens)
+    }
 }
 
 declare_types! {
     pub class JsDecoder for Decoder {
         init(_) {
             // This should not be called from JS
-            Ok(Decoder {
-                decoder: Container::Empty
-            })
+            Ok(Decoder { decoder: None })
         }
     }
 }
@@ -23,70 +35,50 @@ declare_types! {
 fn byte_level(mut cx: FunctionContext) -> JsResult<JsDecoder> {
     let mut decoder = JsDecoder::new::<_, JsDecoder, _>(&mut cx, vec![])?;
     let guard = cx.lock();
-    decoder
-        .borrow_mut(&guard)
-        .decoder
-        .to_owned(Box::new(tk::decoders::byte_level::ByteLevel::new(false)));
+    decoder.borrow_mut(&guard).decoder = Some(Arc::new(
+        tk::decoders::byte_level::ByteLevel::default().into(),
+    ));
     Ok(decoder)
 }
 
-/// wordpiece(prefix: String = "##")
+/// wordpiece(prefix: String = "##", cleanup: bool)
 fn wordpiece(mut cx: FunctionContext) -> JsResult<JsDecoder> {
-    let mut prefix = String::from("##");
-    if let Some(args) = cx.argument_opt(0) {
-        prefix = args.downcast::<JsString>().or_throw(&mut cx)?.value() as String;
-    }
+    let prefix = cx
+        .extract_opt::<String>(0)?
+        .unwrap_or_else(|| String::from("##"));
+    let cleanup = cx.extract_opt::<bool>(1)?.unwrap_or(true);
 
     let mut decoder = JsDecoder::new::<_, JsDecoder, _>(&mut cx, vec![])?;
     let guard = cx.lock();
-    decoder
-        .borrow_mut(&guard)
-        .decoder
-        .to_owned(Box::new(tk::decoders::wordpiece::WordPiece::new(prefix)));
+    decoder.borrow_mut(&guard).decoder = Some(Arc::new(
+        tk::decoders::wordpiece::WordPiece::new(prefix, cleanup).into(),
+    ));
     Ok(decoder)
 }
 
 /// metaspace(replacement: String = "_", add_prefix_space: bool = true)
 fn metaspace(mut cx: FunctionContext) -> JsResult<JsDecoder> {
-    let mut replacement = '▁';
-    if let Some(args) = cx.argument_opt(0) {
-        let rep = args.downcast::<JsString>().or_throw(&mut cx)?.value() as String;
-        replacement = rep.chars().nth(0).ok_or_else(|| {
-            cx.throw_error::<_, ()>("replacement must be a character")
-                .unwrap_err()
-        })?;
-    };
-
-    let mut add_prefix_space = true;
-    if let Some(args) = cx.argument_opt(1) {
-        add_prefix_space = args.downcast::<JsBoolean>().or_throw(&mut cx)?.value() as bool;
-    }
+    let replacement = cx.extract_opt::<char>(0)?.unwrap_or('▁');
+    let add_prefix_space = cx.extract_opt::<bool>(1)?.unwrap_or(true);
 
     let mut decoder = JsDecoder::new::<_, JsDecoder, _>(&mut cx, vec![])?;
     let guard = cx.lock();
-    decoder
-        .borrow_mut(&guard)
-        .decoder
-        .to_owned(Box::new(tk::decoders::metaspace::Metaspace::new(
-            replacement,
-            add_prefix_space,
-        )));
+    decoder.borrow_mut(&guard).decoder = Some(Arc::new(
+        tk::decoders::metaspace::Metaspace::new(replacement, add_prefix_space).into(),
+    ));
     Ok(decoder)
 }
 
 /// bpe_decoder(suffix: String = "</w>")
 fn bpe_decoder(mut cx: FunctionContext) -> JsResult<JsDecoder> {
-    let mut suffix = String::from("</w>");
-    if let Some(args) = cx.argument_opt(0) {
-        suffix = args.downcast::<JsString>().or_throw(&mut cx)?.value() as String;
-    }
+    let suffix = cx
+        .extract_opt::<String>(0)?
+        .unwrap_or_else(|| String::from("</w>"));
 
     let mut decoder = JsDecoder::new::<_, JsDecoder, _>(&mut cx, vec![])?;
     let guard = cx.lock();
-    decoder
-        .borrow_mut(&guard)
-        .decoder
-        .to_owned(Box::new(tk::decoders::bpe::BPEDecoder::new(suffix)));
+    decoder.borrow_mut(&guard).decoder =
+        Some(Arc::new(tk::decoders::bpe::BPEDecoder::new(suffix).into()));
     Ok(decoder)
 }
 
