@@ -1,9 +1,9 @@
 WIP : WASM implementation of Tokenizer
 
 ## Todo
-- [ ] Minimal binding
-- [ ] All functions implementations
-- [ ] Tests
+- [x] Minimal binding
+- [x] All functions implementations (except Threading)
+- [x] Tests
 - [ ] Bench
 - [ ] Node.js examples
 - [ ] Browser examples
