@@ -6,7 +6,8 @@ use clap::{App, AppSettings, Arg, ArgMatches, SubCommand};
 use std::io::{self, BufRead, Write};
 use tokenizers::models::bpe::BPE;
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
-use tokenizers::tokenizer::{AddedToken, EncodeInput, Result, Tokenizer};
+use tokenizers::tokenizer::{AddedToken, Result};
+use tokenizers::Tokenizer;
 
 fn shell(matches: &ArgMatches) -> Result<()> {
     let vocab = matches
@@ -16,21 +17,14 @@ fn shell(matches: &ArgMatches) -> Result<()> {
         .value_of("merges")
         .expect("Must give a merges.txt file");
 
-    let bpe = BPE::from_files(vocab, merges)?.build()?;
-    let mut tokenizer = Tokenizer::new(Box::new(bpe));
-    tokenizer.with_pre_tokenizer(Box::new(ByteLevel::new(true)));
-    tokenizer.with_decoder(Box::new(ByteLevel::new(false)));
+    let bpe = BPE::from_files(vocab, merges).build()?;
+    let mut tokenizer = Tokenizer::new(bpe);
+    tokenizer.with_pre_tokenizer(ByteLevel::default());
+    tokenizer.with_decoder(ByteLevel::default());
 
-    tokenizer.add_tokens(&[
-        AddedToken {
-            content: String::from("ing"),
-            single_word: false,
-        },
-        AddedToken {
-            content: String::from("[ENT]"),
-            single_word: true,
-        },
-    ]);
+    tokenizer.add_tokens(&[AddedToken::from(String::from("ing"), false).single_word(false)]);
+    tokenizer
+        .add_special_tokens(&[AddedToken::from(String::from("[ENT]"), true).single_word(true)]);
 
     let stdin = io::stdin();
     let mut handle = stdin.lock();
@@ -45,7 +39,7 @@ fn shell(matches: &ArgMatches) -> Result<()> {
         let buffer = buffer.trim_end();
 
         let timer = std::time::Instant::now();
-        let encoded = tokenizer.encode(EncodeInput::Single(buffer.to_owned()))?;
+        let encoded = tokenizer.encode(buffer.to_owned(), false)?;
         let elapsed = timer.elapsed();
         println!("\nInput:\t\t{}", buffer);
         println!("Tokens:\t\t{:?}", encoded.get_tokens());

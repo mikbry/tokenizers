@@ -1,11 +1,12 @@
-var native = require('./native');
+const native = require("./native");
 
 module.exports = {
-  bertNormalizer:      native.normalizers_BertNormalizer,
-  nfdNormalizer:       native.normalizers_NFD,
-  nfkdNormalizer:      native.normalizers_NFKD,
-  nfcNormalizer:       native.normalizers_NFC,
-  nfkcNormalizer:      native.normalizers_NFKC,
-  sequenceNormalizer:  native.normalizers_Sequence,
-  lowercaseNormalizer: native.normalizers_Lowercase
+  bertNormalizer: native.normalizers_BertNormalizer,
+  lowercaseNormalizer: native.normalizers_Lowercase,
+  nfcNormalizer: native.normalizers_NFC,
+  nfdNormalizer: native.normalizers_NFD,
+  nfkcNormalizer: native.normalizers_NFKC,
+  nfkdNormalizer: native.normalizers_NFKD,
+  sequenceNormalizer: native.normalizers_Sequence,
+  stripNormalizer: native.normalizers_Strip,
 };

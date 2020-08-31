@@ -1,165 +1,84 @@
-extern crate tokenizers as tk;
-
-use crate::error::PyError;
 use pyo3::exceptions;
 use pyo3::prelude::*;
 use pyo3::types::*;
-use pyo3::{PyMappingProtocol, PyObjectProtocol};
-use tk::tokenizer::PaddingDirection;
+use pyo3::{PyObjectProtocol, PySequenceProtocol};
+use tk::tokenizer::{Offsets, PaddingDirection};
+use tokenizers as tk;
 
-enum IndexableStringType {
-    Original,
-    Normalized,
-}
+use crate::error::PyError;
 
-#[pyclass(dict)]
-pub struct IndexableString {
-    s: tk::tokenizer::NormalizedString,
-    t: IndexableStringType,
-}
-#[pymethods]
-impl IndexableString {}
-
-#[pyproto]
-impl PyObjectProtocol for IndexableString {
-    fn __repr__(&self) -> PyResult<String> {
-        Ok(match self.t {
-            IndexableStringType::Original => self.s.get_original().to_owned(),
-            IndexableStringType::Normalized => self.s.get().to_owned(),
-        })
-    }
-
-    fn __str__(&self) -> PyResult<String> {
-        Ok(match self.t {
-            IndexableStringType::Original => self.s.get_original().to_owned(),
-            IndexableStringType::Normalized => self.s.get().to_owned(),
-        })
-    }
-}
-
-#[pyproto]
-impl PyMappingProtocol for IndexableString {
-    fn __getitem__(&self, item: PyObject) -> PyResult<String> {
-        let gil = Python::acquire_gil();
-        let py = gil.python();
-
-        // Make a slice from a number or get a slice directly
-        let slice = if let Ok(index) = item.extract::<isize>(py) {
-            if index >= self.s.len() as isize || index < -(self.s.len() as isize) {
-                Err(exceptions::IndexError::py_err("Index out of bounds"))
-            } else {
-                Ok(if index == -1 {
-                    PySlice::new(py, index, self.s.len() as isize, 1)
-                } else {
-                    PySlice::new(py, index, index + 1, 1)
-                })
-            }
-        } else if let Ok(slice) = item.cast_as::<PySlice>(py) {
-            Ok(slice)
-        } else if let Ok(offset) = item.cast_as::<PyTuple>(py) {
-            if offset.len() == 2 {
-                let start = offset.get_item(0).extract::<isize>()?;
-                let end = offset.get_item(1).extract::<isize>()?;
-                Ok(PySlice::new(py, start, end, 1))
-            } else {
-                Err(exceptions::TypeError::py_err("Expected Tuple[int, int]"))
-            }
-        } else {
-            Err(exceptions::TypeError::py_err(
-                "Expected number or slice or Tuple[int, int]",
-            ))
-        }?;
-
-        // Find out range from the slice
-        let len: std::os::raw::c_long = (self.s.len() as i32) as _;
-        let PySliceIndices { start, stop, .. } = slice.indices(len)?;
-        let range = start as usize..stop as usize;
-
-        // Get the range from the relevant string
-        let s = match self.t {
-            IndexableStringType::Original => self.s.get_range(range),
-            IndexableStringType::Normalized => self.s.get_range_original(range),
-        };
-
-        s.map(|s| s.to_owned())
-            .ok_or_else(|| exceptions::IndexError::py_err("Wrong offsets"))
-    }
-
-    fn __len__(self) -> PyResult<usize> {
-        Ok(match self.t {
-            IndexableStringType::Original => self.s.len_original(),
-            IndexableStringType::Normalized => self.s.len(),
-        })
-    }
-}
-
-#[pyclass(dict)]
+#[pyclass(dict, module = "tokenizers", name=Encoding)]
 #[repr(transparent)]
-pub struct Encoding {
-    encoding: tk::tokenizer::Encoding,
+pub struct PyEncoding {
+    pub encoding: tk::tokenizer::Encoding,
 }
 
-impl Encoding {
-    pub fn new(encoding: tk::tokenizer::Encoding) -> Self {
-        Encoding { encoding }
+impl From<tk::tokenizer::Encoding> for PyEncoding {
+    fn from(v: tk::tokenizer::Encoding) -> Self {
+        Self { encoding: v }
     }
 }
 
 #[pyproto]
-impl PyObjectProtocol for Encoding {
+impl PyObjectProtocol for PyEncoding {
     fn __repr__(&self) -> PyResult<String> {
         Ok(format!(
             "Encoding(num_tokens={}, attributes=[ids, type_ids, tokens, offsets, \
-             attention_mask, special_tokens_mask, overflowing, original_str, normalized_str])",
+             attention_mask, special_tokens_mask, overflowing])",
             self.encoding.get_ids().len()
         ))
     }
 }
 
+#[pyproto]
+impl PySequenceProtocol for PyEncoding {
+    fn __len__(self) -> PyResult<usize> {
+        Ok(self.encoding.len())
+    }
+}
+
 #[pymethods]
-impl Encoding {
-    #[getter]
-    fn get_normalized_str(&self) -> IndexableString {
-        IndexableString {
-            s: self.encoding.get_normalized().clone(),
-            t: IndexableStringType::Normalized,
-        }
+impl PyEncoding {
+    #[new]
+    fn new() -> PyResult<Self> {
+        Ok(Self {
+            encoding: tk::tokenizer::Encoding::default(),
+        })
     }
 
-    #[getter]
-    fn get_original_str(&self) -> IndexableString {
-        IndexableString {
-            s: self.encoding.get_normalized().clone(),
-            t: IndexableStringType::Original,
-        }
+    fn __getstate__(&self, py: Python) -> PyResult<PyObject> {
+        let data = serde_json::to_string(&self.encoding).map_err(|e| {
+            exceptions::Exception::py_err(format!(
+                "Error while attempting to pickle Encoding: {}",
+                e.to_string()
+            ))
+        })?;
+        Ok(PyBytes::new(py, data.as_bytes()).to_object(py))
     }
 
-    #[args(kwargs = "**")]
-    fn get_range(
-        &self,
-        range: (usize, usize),
-        kwargs: Option<&PyDict>,
-    ) -> PyResult<Option<String>> {
-        let mut original = false;
-        if let Some(kwargs) = kwargs {
-            if let Some(koriginal) = kwargs.get_item("original") {
-                original = koriginal.extract()?;
+    fn __setstate__(&mut self, py: Python, state: PyObject) -> PyResult<()> {
+        match state.extract::<&PyBytes>(py) {
+            Ok(s) => {
+                self.encoding = serde_json::from_slice(s.as_bytes()).map_err(|e| {
+                    exceptions::Exception::py_err(format!(
+                        "Error while attempting to unpickle Encoding: {}",
+                        e.to_string()
+                    ))
+                })?;
+                Ok(())
             }
+            Err(e) => Err(e),
         }
+    }
 
-        if original {
-            Ok(self
-                .encoding
-                .get_normalized()
-                .get_range_original(range.0..range.1)
-                .map(|s| s.to_owned()))
-        } else {
-            Ok(self
-                .encoding
-                .get_normalized()
-                .get_range(range.0..range.1)
-                .map(|s| s.to_owned()))
-        }
+    #[staticmethod]
+    #[args(growing_offsets = true)]
+    fn merge(encodings: Vec<PyRef<PyEncoding>>, growing_offsets: bool) -> PyEncoding {
+        tk::tokenizer::Encoding::merge(
+            encodings.into_iter().map(|e| e.encoding.clone()),
+            growing_offsets,
+        )
+        .into()
     }
 
     #[getter]
@@ -170,6 +89,11 @@ impl Encoding {
     #[getter]
     fn get_tokens(&self) -> Vec<String> {
         self.encoding.get_tokens().to_vec()
+    }
+
+    #[getter]
+    fn get_words(&self) -> Vec<Option<u32>> {
+        self.encoding.get_words().to_vec()
     }
 
     #[getter]
@@ -193,8 +117,37 @@ impl Encoding {
     }
 
     #[getter]
-    fn get_overflowing(&self) -> Option<Encoding> {
-        self.encoding.get_overflowing().cloned().map(Encoding::new)
+    fn get_overflowing(&self) -> Vec<PyEncoding> {
+        self.encoding
+            .get_overflowing()
+            .clone()
+            .into_iter()
+            .map(|e| e.into())
+            .collect()
+    }
+
+    fn word_to_tokens(&self, word_index: u32) -> Option<(usize, usize)> {
+        self.encoding.word_to_tokens(word_index)
+    }
+
+    fn word_to_chars(&self, word_index: u32) -> Option<Offsets> {
+        self.encoding.word_to_chars(word_index)
+    }
+
+    fn token_to_chars(&self, token_index: usize) -> Option<Offsets> {
+        self.encoding.token_to_chars(token_index)
+    }
+
+    fn token_to_word(&self, token_index: usize) -> Option<u32> {
+        self.encoding.token_to_word(token_index)
+    }
+
+    fn char_to_token(&self, char_pos: usize) -> Option<usize> {
+        self.encoding.char_to_token(char_pos)
+    }
+
+    fn char_to_word(&self, char_pos: usize) -> Option<u32> {
+        self.encoding.char_to_word(char_pos)
     }
 
     #[args(kwargs = "**")]
@@ -231,7 +184,7 @@ impl Encoding {
 
         Ok(self
             .encoding
-            .pad(length, pad_id, pad_type_id, pad_token, &direction))
+            .pad(length, pad_id, pad_type_id, pad_token, direction))
     }
 
     #[args(kwargs = "**")]

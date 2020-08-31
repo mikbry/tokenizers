@@ -1,10 +1,16 @@
 name: Rust
 
-on: [push]
+on:
+  push:
+    branches:
+      - master
+  pull_request:
 
 jobs:
   build:
     runs-on: ${{ matrix.os }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: 10.11
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macOS-latest]
@@ -19,17 +25,9 @@ jobs:
           components: rustfmt, clippy
           override: true
 
-      - name: Cache Cargo Registry
-        uses: actions/cache@v1
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.toml') }}
-
-      - name: Cache Cargo Build Target
-        uses: actions/cache@v1
-        with:
-          path: tokenizers/target
-          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.toml') }}
+      # Necessary for now for the cargo cache: https://github.com/actions/cache/issues/133#issuecomment-599102035
+      - if: matrix.os == 'ubuntu-latest'
+        run: sudo chown -R $(whoami):$(id -ng) ~/.cargo/
 
       - name: Build
         uses: actions-rs/cargo@v1
@@ -41,22 +39,37 @@ jobs:
         uses: actions-rs/cargo@v1
         with:
           command: fmt
-          args:  --manifest-path ./tokenizers/Cargo.toml -- --check
+          args: --manifest-path ./tokenizers/Cargo.toml -- --check
 
       - name: Lint Benchmarks with RustFmt
         uses: actions-rs/cargo@v1
         with:
           command: fmt
-          args:  --manifest-path ./tokenizers/Cargo.toml -- ./tokenizers/benches/bpe_benchmark.rs --check
+          args: --manifest-path ./tokenizers/Cargo.toml -- ./tokenizers/benches/bpe_benchmark.rs --check
 
       - name: Lint with Clippy
         uses: actions-rs/cargo@v1
         with:
           command: clippy
-          args:  --manifest-path ./tokenizers/Cargo.toml --all-targets --all-features -- -D warnings
+          args: --manifest-path ./tokenizers/Cargo.toml --all-targets --all-features -- -D warnings
 
       - name: Run Tests
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        working-directory: ./tokenizers
+        run: make test
+
+      # Skip integration tests for now on Windows
+      - name: Run lib Tests on Windows
+        if: matrix.os == 'windows-latest'
         uses: actions-rs/cargo@v1
         with:
           command: test
-          args: --verbose --manifest-path ./tokenizers/Cargo.toml
+          args: --verbose --manifest-path ./tokenizers/Cargo.toml --lib
+
+      - name: Run doc Tests on Windows
+        if: matrix.os == 'windows-latest'
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --verbose --manifest-path ./tokenizers/Cargo.toml --doc

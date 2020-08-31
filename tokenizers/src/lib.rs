@@ -29,28 +29,37 @@
 //! use tokenizers::models::bpe::BPE;
 //!
 //! fn main() -> Result<()> {
-//! 	let bpe_builder = BPE::from_files("./path/to/vocab.json", "./path/to/merges.txt")?;
-//! 	let bpe = bpe_builder
-//! 		.dropout(0.1)
-//! 		.unk_token("[UNK]".into())
-//! 		.build()?;
+//!     let bpe_builder = BPE::from_files("./path/to/vocab.json", "./path/to/merges.txt");
+//!     let bpe = bpe_builder
+//!         .dropout(0.1)
+//!         .unk_token("[UNK]".into())
+//!         .build()?;
 //!
-//! 	let mut tokenizer = Tokenizer::new(Box::new(bpe));
+//!     let mut tokenizer = Tokenizer::new(bpe);
 //!
-//! 	let encoding = tokenizer.encode(EncodeInput::Single("Hey there!".into()))?;
-//! 	println!("{:?}", encoding.get_tokens());
+//!     let encoding = tokenizer.encode("Hey there!", false)?;
+//!     println!("{:?}", encoding.get_tokens());
 //!
-//! 	Ok(())
+//!     Ok(())
 //! }
 //! ```
 
 #[macro_use]
+extern crate log;
+#[macro_use]
 extern crate lazy_static;
 
+#[macro_use]
+pub mod utils;
 pub mod decoders;
 pub mod models;
 pub mod normalizers;
 pub mod pre_tokenizers;
 pub mod processors;
 pub mod tokenizer;
-pub mod utils;
+
+// Re-export from tokenizer
+pub use tokenizer::*;
+
+// Re-export also parallelism utils
+pub use utils::parallelism;

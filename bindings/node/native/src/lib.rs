@@ -1,8 +1,14 @@
+#![warn(clippy::all)]
+
 extern crate neon;
+extern crate neon_serde;
+#[macro_use]
+extern crate serde;
 extern crate tokenizers as tk;
 
 mod decoders;
 mod encoding;
+mod extraction;
 mod models;
 mod normalizers;
 mod pre_tokenizers;
@@ -29,6 +35,8 @@ register_module!(mut m, {
     pre_tokenizers::register(&mut m, "pre_tokenizers")?;
     // Trainers
     trainers::register(&mut m, "trainers")?;
+    // Utils
+    utils::register(&mut m, "utils")?;
 
     Ok(())
 });

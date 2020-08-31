@@ -27,6 +27,13 @@ versatility.
  - Normalization comes with alignments tracking. It's always possible to get the part of the
    original sentence that corresponds to a given token.
  - Does all the pre-processing: Truncate, Pad, add the special tokens your model needs.
+
+## Bindings
+
+We provide bindings to the following languages (more to come!):
+  - [Rust](https://github.com/huggingface/tokenizers/tree/master/tokenizers) (Original implementation)
+  - [Python](https://github.com/huggingface/tokenizers/tree/master/bindings/python)
+  - [Node.js](https://github.com/huggingface/tokenizers/tree/master/bindings/node)
  
 ## Quick examples using Python:
 
@@ -35,7 +42,7 @@ Start using in a matter of seconds:
 ```python
 # Tokenizers provides ultra-fast implementations of most current tokenizers:
 >>> from tokenizers import (ByteLevelBPETokenizer,
-                            BPETokenizer,
+                            CharBPETokenizer,
                             SentencePieceBPETokenizer,
                             BertWordPieceTokenizer)
 # Ultra-fast => they can encode 1GB of text in ~20sec on a standard server's CPU
@@ -54,7 +61,7 @@ Encoding(num_tokens=13, attributes=[ids, type_ids, tokens, offsets, attention_ma
 ['[CLS]', 'hello', ',', 'y', "'", 'all', '!', 'how', 'are', 'you', '[UNK]', '?', '[SEP]']
 [(0, 0), (0, 5), (5, 6), (7, 8), (8, 9), (9, 12), (12, 13), (14, 17), (18, 21), (22, 25), (26, 27),
  (28, 29), (0, 0)]
-# Here is an example using the offsets mapping to retrieve the string coresponding to the 10th token:
+# Here is an example using the offsets mapping to retrieve the string corresponding to the 10th token:
 >>> output.original_str[output.offsets[10]]
 '😁'
 ```
@@ -69,10 +76,8 @@ And training a new vocabulary is just as easy:
 [00:00:00] Count pairs                    ████████████████████████████████████████   20993/20993
 [00:00:03] Compute merges                 ████████████████████████████████████████   19375/19375
 ```
+ 
+## Contributors
+  
+[![](https://sourcerer.io/fame/clmnt/huggingface/tokenizers/images/0)](https://sourcerer.io/fame/clmnt/huggingface/tokenizers/links/0)[![](https://sourcerer.io/fame/clmnt/huggingface/tokenizers/images/1)](https://sourcerer.io/fame/clmnt/huggingface/tokenizers/links/1)[![](https://sourcerer.io/fame/clmnt/huggingface/tokenizers/images/2)](https://sourcerer.io/fame/clmnt/huggingface/tokenizers/links/2)[![](https://sourcerer.io/fame/clmnt/huggingface/tokenizers/images/3)](https://sourcerer.io/fame/clmnt/huggingface/tokenizers/links/3)[![](https://sourcerer.io/fame/clmnt/huggingface/tokenizers/images/4)](https://sourcerer.io/fame/clmnt/huggingface/tokenizers/links/4)[![](https://sourcerer.io/fame/clmnt/huggingface/tokenizers/images/5)](https://sourcerer.io/fame/clmnt/huggingface/tokenizers/links/5)[![](https://sourcerer.io/fame/clmnt/huggingface/tokenizers/images/6)](https://sourcerer.io/fame/clmnt/huggingface/tokenizers/links/6)[![](https://sourcerer.io/fame/clmnt/huggingface/tokenizers/images/7)](https://sourcerer.io/fame/clmnt/huggingface/tokenizers/links/7)
 
-## Bindings
-
-We provide bindings to the following languages (more to come!):
-  - [Rust](https://github.com/huggingface/tokenizers/tree/master/tokenizers) (Original implementation)
-  - [Python](https://github.com/huggingface/tokenizers/tree/master/bindings/python)
-  - [Node.js](https://github.com/huggingface/tokenizers/tree/master/bindings/node)

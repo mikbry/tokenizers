@@ -23,9 +23,12 @@ impl std::error::Error for PyError {}
 pub struct ToPyResult<T>(pub Result<T>);
 impl<T> std::convert::Into<PyResult<T>> for ToPyResult<T> {
     fn into(self) -> PyResult<T> {
-        match self.0 {
-            Ok(o) => Ok(o),
-            Err(e) => Err(exceptions::Exception::py_err(format!("{}", e))),
-        }
+        self.0
+            .map_err(|e| exceptions::Exception::py_err(format!("{}", e)))
+    }
+}
+impl<T> ToPyResult<T> {
+    pub fn into_py(self) -> PyResult<T> {
+        self.into()
     }
 }

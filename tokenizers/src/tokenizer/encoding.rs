@@ -1,41 +1,45 @@
-use crate::tokenizer::NormalizedString;
-
-/// The various possible padding directions.
-#[derive(Debug, Clone)]
-pub enum PaddingDirection {
-    Left,
-    Right,
-}
+use crate::parallelism::*;
+use crate::tokenizer::{Offsets, Token};
+use crate::utils::padding::PaddingDirection;
+use serde::{Deserialize, Serialize};
 
 /// Represents the output of a `Tokenizer`.
-#[derive(Default, PartialEq, Debug, Clone)]
+#[derive(Default, PartialEq, Debug, Clone, Serialize, Deserialize)]
 pub struct Encoding {
-    normalized: NormalizedString,
+    /// IDs produced by the `Tokenizer`
     ids: Vec<u32>,
+    /// Type of the IDs
     type_ids: Vec<u32>,
+    /// Tokens associated to each ID
     tokens: Vec<String>,
-    offsets: Vec<(usize, usize)>,
+    /// Indice of the word associated to each token/ID
+    words: Vec<Option<u32>>,
+    /// Offsets of the token/ID from the NormalizedString
+    offsets: Vec<Offsets>,
+    /// Mask identifying special tokens
     special_tokens_mask: Vec<u32>,
+    /// Mask identifying padding tokens for the attention mechanism
     attention_mask: Vec<u32>,
-    overflowing: Option<Box<Encoding>>,
+    /// A list of overflowing Encoding generated when we got truncated
+    overflowing: Vec<Encoding>,
 }
 impl Encoding {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        normalized: NormalizedString,
         ids: Vec<u32>,
         type_ids: Vec<u32>,
         tokens: Vec<String>,
-        offsets: Vec<(usize, usize)>,
+        words: Vec<Option<u32>>,
+        offsets: Vec<Offsets>,
         special_tokens_mask: Vec<u32>,
         attention_mask: Vec<u32>,
-        overflowing: Option<Box<Encoding>>,
+        overflowing: Vec<Encoding>,
     ) -> Self {
         Encoding {
-            normalized,
             ids,
             type_ids,
             tokens,
+            words,
             offsets,
             special_tokens_mask,
             attention_mask,
@@ -43,12 +47,65 @@ impl Encoding {
         }
     }
 
-    pub fn get_normalized(&self) -> &NormalizedString {
-        &self.normalized
+    pub fn with_capacity(len: usize) -> Self {
+        Encoding {
+            ids: Vec::with_capacity(len),
+            type_ids: Vec::with_capacity(len),
+            tokens: Vec::with_capacity(len),
+            words: Vec::with_capacity(len),
+            offsets: Vec::with_capacity(len),
+            special_tokens_mask: Vec::with_capacity(len),
+            attention_mask: Vec::with_capacity(len),
+            overflowing: vec![],
+        }
+    }
+
+    pub fn from_tokens(tokens: Vec<Token>, type_id: u32) -> Self {
+        let length = tokens.len();
+        let (ids, tokens, offsets) = tokens.into_iter().fold(
+            (
+                Vec::with_capacity(length),
+                Vec::with_capacity(length),
+                Vec::with_capacity(length),
+            ),
+            |(mut ids, mut tokens, mut offsets), t| {
+                ids.push(t.id);
+                tokens.push(t.value);
+                offsets.push(t.offsets);
+                (ids, tokens, offsets)
+            },
+        );
+
+        Encoding {
+            ids,
+            tokens,
+            offsets,
+            words: vec![None; length],
+            type_ids: vec![type_id; length],
+            attention_mask: vec![1; length],
+            special_tokens_mask: vec![0; length],
+            overflowing: vec![],
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.ids.len()
     }
 
     pub fn get_tokens(&self) -> &[String] {
         &self.tokens[..]
+    }
+
+    pub fn get_words(&self) -> &[Option<u32>] {
+        &self.words
+    }
+
+    pub fn get_words_mut(&mut self) -> &mut [Option<u32>] {
+        &mut self.words
     }
 
     pub fn get_ids(&self) -> &[u32] {
@@ -59,8 +116,12 @@ impl Encoding {
         &self.type_ids
     }
 
-    pub fn get_offsets(&self) -> &[(usize, usize)] {
+    pub fn get_offsets(&self) -> &[Offsets] {
         &self.offsets
+    }
+
+    pub fn get_offsets_mut(&mut self) -> &mut [Offsets] {
+        &mut self.offsets
     }
 
     pub fn get_special_tokens_mask(&self) -> &[u32] {
@@ -71,60 +132,209 @@ impl Encoding {
         &self.attention_mask
     }
 
-    pub fn get_overflowing(&self) -> Option<&Encoding> {
-        self.overflowing.as_ref().map(|b| &**b)
+    pub fn get_overflowing(&self) -> &Vec<Encoding> {
+        &self.overflowing
     }
 
-    pub fn take_overflowing(&mut self) -> Option<Box<Encoding>> {
-        self.overflowing.take()
+    pub fn get_overflowing_mut(&mut self) -> &mut Vec<Encoding> {
+        &mut self.overflowing
     }
 
+    pub fn take_overflowing(&mut self) -> Vec<Encoding> {
+        std::mem::replace(&mut self.overflowing, vec![])
+    }
+
+    /// Get the encoded tokens corresponding to the word at the given index in the input sequence,
+    /// with the form (start_token, end_token + 1)
+    pub fn word_to_tokens(&self, word: u32) -> Option<(usize, usize)> {
+        let (mut start, mut end) = (None, None);
+        self.words
+            .iter()
+            .enumerate()
+            .take_while(|(_, w)| **w <= Some(word))
+            .filter(|(_, w)| **w == Some(word))
+            .for_each(|(i, _)| {
+                if start.is_none() || Some(i) < start {
+                    start = Some(i);
+                }
+                if end.is_none() || Some(i) >= end {
+                    end = Some(i + 1);
+                }
+            });
+
+        if let (Some(start), Some(end)) = (start, end) {
+            Some((start, end))
+        } else {
+            None
+        }
+    }
+
+    /// Get the offsets of the word at the given index in the input sequence.
+    pub fn word_to_chars(&self, word: u32) -> Option<Offsets> {
+        self.word_to_tokens(word)
+            .map(|(start, end)| {
+                if end == 0 {
+                    None
+                } else {
+                    Some((self.offsets[start].0, self.offsets[end - 1].1))
+                }
+            })
+            .flatten()
+    }
+
+    /// Get the offsets of the token at the given index.
+    pub fn token_to_chars(&self, token: usize) -> Option<Offsets> {
+        self.offsets.get(token).copied()
+    }
+
+    /// Get the word that contains the token at the given index.
+    pub fn token_to_word(&self, token: usize) -> Option<u32> {
+        self.words.get(token).copied().flatten()
+    }
+
+    /// Get the token that contains the given char.
+    pub fn char_to_token(&self, pos: usize) -> Option<usize> {
+        self.offsets
+            .iter()
+            .position(|(start, end)| pos >= *start && pos < *end)
+    }
+
+    /// Get the word that contains the given char.
+    pub fn char_to_word(&self, pos: usize) -> Option<u32> {
+        self.char_to_token(pos)
+            .map(|token| self.token_to_word(token))
+            .flatten()
+    }
+
+    /// Truncate the current `Encoding`.
+    ///
+    /// Panic if `stride >= max_len` or `max_len == 0`.
     pub fn truncate(&mut self, max_len: usize, stride: usize) {
         if max_len >= self.ids.len() {
             return;
         }
+        // We only truncate if max_len > 0, it makes no sense otherwise
+        assert!(max_len > 0);
 
-        let mut o_ids = self.ids.split_off(max_len);
-        let mut o_type_ids = self.type_ids.split_off(max_len);
-        let mut o_tokens = self.tokens.split_off(max_len);
-        let mut o_offsets = self.offsets.split_off(max_len);
-        let mut o_spe_toks = self.special_tokens_mask.split_off(max_len);
-        let mut o_attent = self.attention_mask.split_off(max_len);
+        // Get the main overflowing part
+        let o_ids = self.ids.split_off(max_len);
+        let o_type_ids = self.type_ids.split_off(max_len);
+        let o_tokens = self.tokens.split_off(max_len);
+        let o_words = self.words.split_off(max_len);
+        let o_offsets = self.offsets.split_off(max_len);
+        let o_spe_toks = self.special_tokens_mask.split_off(max_len);
+        let o_attent = self.attention_mask.split_off(max_len);
 
-        let max = self.offsets.last().map(|(_, end)| *end).unwrap_or(0);
-        let trunc_normalized = self.normalized.split_off(max);
+        // Now we need to separate the overflowing part into as many Encoding as needed
+        assert!(stride < max_len);
+        let part_size = max_len - stride;
+        let mut overflowing = vec![];
+        let mut part_id = 0;
+        let mut prev_encoding: &Encoding = self;
 
-        if stride > 0 {
-            o_ids = prepend_stride(&self.ids, o_ids, stride);
-            o_type_ids = prepend_stride(&self.type_ids, o_type_ids, stride);
-            o_tokens = prepend_stride(&self.tokens, o_tokens, stride);
-            o_offsets = prepend_stride(&self.offsets, o_offsets, stride);
-            o_spe_toks = prepend_stride(&self.special_tokens_mask, o_spe_toks, stride);
-            o_attent = prepend_stride(&self.attention_mask, o_attent, stride);
+        loop {
+            if part_size * part_id >= o_ids.len() {
+                break;
+            }
+
+            let o = Encoding {
+                ids: get_current_part(&prev_encoding.ids, &o_ids, part_size, part_id, stride),
+                type_ids: get_current_part(
+                    &prev_encoding.type_ids,
+                    &o_type_ids,
+                    part_size,
+                    part_id,
+                    stride,
+                ),
+                tokens: get_current_part(
+                    &prev_encoding.tokens,
+                    &o_tokens,
+                    part_size,
+                    part_id,
+                    stride,
+                ),
+                words: get_current_part(&prev_encoding.words, &o_words, part_size, part_id, stride),
+                offsets: get_current_part(
+                    &prev_encoding.offsets,
+                    &o_offsets,
+                    part_size,
+                    part_id,
+                    stride,
+                ),
+                special_tokens_mask: get_current_part(
+                    &prev_encoding.special_tokens_mask,
+                    &o_spe_toks,
+                    part_size,
+                    part_id,
+                    stride,
+                ),
+                attention_mask: get_current_part(
+                    &prev_encoding.attention_mask,
+                    &o_attent,
+                    part_size,
+                    part_id,
+                    stride,
+                ),
+                overflowing: vec![],
+            };
+
+            part_id += 1;
+            overflowing.push(o);
+            prev_encoding = &overflowing.last().unwrap();
         }
 
-        self.overflowing = Some(Box::new(Encoding {
-            normalized: trunc_normalized,
-            ids: o_ids,
-            type_ids: o_type_ids,
-            tokens: o_tokens,
-            offsets: o_offsets,
-            special_tokens_mask: o_spe_toks,
-            attention_mask: o_attent,
-            overflowing: None,
-        }));
+        self.overflowing = overflowing;
     }
 
-    pub fn merge_with(&mut self, pair: Encoding) {
-        self.normalized.merge_with(&pair.normalized);
+    /// Merge all Encodings together
+    pub fn merge<I: IntoIterator<Item = Encoding>>(encodings: I, growing_offsets: bool) -> Self {
+        let mut encoding = Encoding::default();
+
+        for sub in encodings {
+            encoding.merge_with(sub, growing_offsets);
+        }
+
+        encoding
+    }
+
+    /// Merge ourself with the given `Encoding`. Happens in place.
+    pub fn merge_with(&mut self, pair: Encoding, growing_offsets: bool) {
+        // Handle merging the overflowing parts too: Combine them all
+        // In most of the cases, we expect `pair.overflowing.len() == 0`
+        let mut overflowings = vec![];
+
+        // 1. All our overflowings with all the others
+        for self_o in &self.overflowing {
+            // 1. The pair itself
+            let mut n_encoding = self_o.clone();
+            n_encoding.merge_with(pair.clone(), growing_offsets);
+            overflowings.push(n_encoding);
+
+            // 2. Its overflowings (this should rarely happen...)
+            for other_o in &pair.overflowing {
+                let mut n_encoding = self_o.clone();
+                n_encoding.merge_with(other_o.clone(), growing_offsets);
+                overflowings.push(n_encoding);
+            }
+        }
+        // 2. Ourself with all the other overflowings (this should rarely happen too...)
+        for other_o in &pair.overflowing {
+            let mut n_encoding = self.clone();
+            n_encoding.merge_with(other_o.clone(), growing_offsets);
+            overflowings.push(n_encoding);
+        }
+
+        // Finish by merging ourself with the other encoding
         self.ids.extend(pair.ids);
         self.type_ids.extend(pair.type_ids);
         self.tokens.extend(pair.tokens);
+        self.words.extend(pair.words);
 
-        let starting_offset = self
-            .offsets
-            .iter()
-            .fold(0, |max, (_, end)| if *end > max { *end } else { max });
+        let starting_offset = if growing_offsets {
+            self.offsets.last().map_or(0, |o| o.1)
+        } else {
+            0
+        };
         self.offsets.extend(
             pair.offsets
                 .into_iter()
@@ -133,65 +343,118 @@ impl Encoding {
         );
         self.special_tokens_mask.extend(pair.special_tokens_mask);
         self.attention_mask.extend(pair.attention_mask);
-        // TODO: Handle the overflowing
+        self.overflowing = overflowings;
     }
 
     pub fn pad(
         &mut self,
-        pad_length: usize,
+        target_length: usize,
         pad_id: u32,
         pad_type_id: u32,
         pad_token: &str,
-        direction: &PaddingDirection,
+        direction: PaddingDirection,
     ) {
-        if self.ids.len() > pad_length {
+        // Dispatch call to all the overflowings first
+        self.overflowing.maybe_par_iter_mut().for_each(|encoding| {
+            encoding.pad(target_length, pad_id, pad_type_id, pad_token, direction)
+        });
+
+        // Then check if we should pad ourself
+        if self.ids.len() >= target_length {
             // We just do nothing if the wanted padding length is smaller than us
             return;
         }
-        let pad_length = pad_length - self.ids.len();
-
-        let ids_pad = vec![pad_id; pad_length];
-        let type_ids_pad = vec![pad_type_id; pad_length];
-        let tokens_pad = vec![pad_token.to_owned(); pad_length];
-        let attention_pad = vec![0; pad_length];
-        let special_pad = vec![1; pad_length];
-        let offsets_pad = vec![(0, 0); pad_length];
+        let pad_length = target_length - self.ids.len();
 
         match direction {
             PaddingDirection::Left => {
-                self.ids = [&ids_pad[..], &self.ids[..]].concat();
-                self.type_ids = [&type_ids_pad[..], &self.type_ids[..]].concat();
-                self.tokens = [&tokens_pad[..], &self.tokens[..]].concat();
-                self.attention_mask = [&attention_pad[..], &self.attention_mask[..]].concat();
-                self.special_tokens_mask =
-                    [&special_pad[..], &self.special_tokens_mask[..]].concat();
-                self.offsets = [&offsets_pad[..], &self.offsets[..]].concat();
+                self.ids = (0..pad_length)
+                    .map(|_| pad_id)
+                    .chain(self.ids.drain(..))
+                    .collect();
+                self.type_ids = (0..pad_length)
+                    .map(|_| pad_type_id)
+                    .chain(self.type_ids.drain(..))
+                    .collect();
+                self.tokens = (0..pad_length)
+                    .map(|_| pad_token.to_owned())
+                    .chain(self.tokens.drain(..))
+                    .collect();
+                self.words = (0..pad_length)
+                    .map(|_| None)
+                    .chain(self.words.drain(..))
+                    .collect();
+                self.attention_mask = (0..pad_length)
+                    .map(|_| 0)
+                    .chain(self.attention_mask.drain(..))
+                    .collect();
+                self.special_tokens_mask = (0..pad_length)
+                    .map(|_| 1)
+                    .chain(self.special_tokens_mask.drain(..))
+                    .collect();
+                self.offsets = (0..pad_length)
+                    .map(|_| (0, 0))
+                    .chain(self.offsets.drain(..))
+                    .collect();
             }
             PaddingDirection::Right => {
-                self.ids = [&self.ids[..], &ids_pad[..]].concat();
-                self.type_ids = [&self.type_ids[..], &type_ids_pad[..]].concat();
-                self.tokens = [&self.tokens[..], &tokens_pad[..]].concat();
-                self.attention_mask = [&self.attention_mask[..], &attention_pad[..]].concat();
-                self.special_tokens_mask =
-                    [&self.special_tokens_mask[..], &special_pad[..]].concat();
-                self.offsets = [&self.offsets[..], &offsets_pad[..]].concat();
+                self.ids.extend((0..pad_length).map(|_| pad_id));
+                self.type_ids.extend((0..pad_length).map(|_| pad_type_id));
+                self.tokens
+                    .extend((0..pad_length).map(|_| pad_token.to_owned()));
+                self.words.extend((0..pad_length).map(|_| None));
+                self.attention_mask.extend((0..pad_length).map(|_| 0));
+                self.special_tokens_mask.extend((0..pad_length).map(|_| 1));
+                self.offsets.extend((0..pad_length).map(|_| (0, 0)));
             }
         }
     }
 }
 
-/// Prepend the `stride` last elements of the `previous` `Vec` to the current `Vec`.
-// A new Vec is instantiated though.
-fn prepend_stride<T: Clone>(previous: &[T], current: Vec<T>, stride: usize) -> Vec<T> {
-    let prev = previous
-        .iter()
-        .rev()
-        .take(stride)
-        .cloned()
-        .rev()
-        .collect::<Vec<_>>();
+impl std::iter::FromIterator<Encoding> for Encoding {
+    fn from_iter<I: IntoIterator<Item = Encoding>>(iter: I) -> Self {
+        Self::merge(iter, false)
+    }
+}
 
-    [&prev[..], &current[..]].concat()
+impl std::iter::FromIterator<(u32, String, (usize, usize), Option<u32>, u32)> for Encoding {
+    fn from_iter<I: IntoIterator<Item = (u32, String, (usize, usize), Option<u32>, u32)>>(
+        iter: I,
+    ) -> Self {
+        let items = iter.into_iter();
+        let (lower, upper) = items.size_hint();
+        let length = upper.unwrap_or(lower);
+        let mut encoding = Self::with_capacity(length);
+
+        for (id, token, offsets, word, type_id) in items {
+            encoding.ids.push(id);
+            encoding.tokens.push(token);
+            encoding.offsets.push(offsets);
+            encoding.type_ids.push(type_id);
+            encoding.words.push(word);
+            encoding.special_tokens_mask.push(0);
+            encoding.attention_mask.push(1);
+        }
+
+        encoding
+    }
+}
+
+#[inline]
+fn get_current_part<T: Clone>(
+    prev: &[T],
+    current: &[T],
+    size: usize,
+    idx: usize,
+    stride: usize,
+) -> Vec<T> {
+    let curr_slice = if (idx + 1) * size > current.len() {
+        &current[idx * size..]
+    } else {
+        &current[idx * size..(idx + 1) * size]
+    };
+    let prev_slice = &prev[prev.len() - stride..];
+    [prev_slice, curr_slice].concat()
 }
 
 #[cfg(test)]
@@ -199,48 +462,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_prepend_stride() {
-        let prev = vec![1, 2, 3, 4, 5, 6, 7, 8];
-        let curr = vec![9, 10, 11, 12];
-
-        assert_eq!(prepend_stride(&prev, curr, 3), vec![6, 7, 8, 9, 10, 11, 12]);
-    }
-
-    #[test]
     fn merge_encodings() {
         let mut a = Encoding {
-            normalized: NormalizedString::from("Hello "),
             ids: vec![1],
             type_ids: vec![0],
             tokens: vec![String::from("Hello ")],
+            words: vec![Some(0)],
             offsets: vec![(0, 6)],
             special_tokens_mask: vec![0],
             attention_mask: vec![1],
-            overflowing: None,
+            overflowing: vec![],
         };
         let b = Encoding {
-            normalized: NormalizedString::from("World!"),
             ids: vec![2],
             type_ids: vec![1],
             tokens: vec![String::from("World!")],
+            words: vec![Some(0)],
             offsets: vec![(0, 6)],
             special_tokens_mask: vec![0],
             attention_mask: vec![1],
-            overflowing: None,
+            overflowing: vec![],
         };
-        a.merge_with(b);
+        a.merge_with(b, true);
 
         assert_eq!(
             a,
             Encoding {
-                normalized: NormalizedString::from("Hello World!"),
                 ids: vec![1, 2],
                 type_ids: vec![0, 1],
                 tokens: vec![String::from("Hello "), String::from("World!")],
+                words: vec![Some(0), Some(0)],
                 offsets: vec![(0, 6), (6, 12)],
                 special_tokens_mask: vec![0, 0],
                 attention_mask: vec![1, 1],
-                overflowing: None,
+                overflowing: vec![],
             }
         );
     }
@@ -248,7 +503,6 @@ mod tests {
     #[test]
     fn truncate() {
         let mut a = Encoding {
-            normalized: NormalizedString::from("Hello World!"),
             ids: vec![1, 2, 3],
             type_ids: vec![0, 0, 0],
             tokens: vec![
@@ -256,34 +510,93 @@ mod tests {
                 String::from("World"),
                 String::from("!"),
             ],
+            words: vec![Some(0), Some(1), Some(2)],
             offsets: vec![(0, 5), (6, 11), (11, 12)],
             special_tokens_mask: vec![0, 0, 0],
             attention_mask: vec![1, 1, 1],
-            overflowing: None,
+            overflowing: vec![],
         };
         a.truncate(2, 0);
 
         assert_eq!(
             a,
             Encoding {
-                normalized: NormalizedString::from("Hello World"),
                 ids: vec![1, 2],
                 type_ids: vec![0, 0],
                 tokens: vec![String::from("Hello"), String::from("World")],
+                words: vec![Some(0), Some(1)],
                 offsets: vec![(0, 5), (6, 11)],
                 special_tokens_mask: vec![0, 0],
                 attention_mask: vec![1, 1],
-                overflowing: Some(Box::new(Encoding {
-                    normalized: NormalizedString::from("!"),
+                overflowing: vec![Encoding {
                     ids: vec![3],
                     type_ids: vec![0],
                     tokens: vec![String::from("!")],
+                    words: vec![Some(2)],
                     offsets: vec![(11, 12)],
                     special_tokens_mask: vec![0],
                     attention_mask: vec![1],
-                    overflowing: None,
-                }))
+                    overflowing: vec![],
+                }]
             }
         );
+    }
+
+    #[test]
+    fn mappings() {
+        let encoding = Encoding {
+            tokens: vec![
+                "He".into(),
+                "llo".into(),
+                "won".into(),
+                "der".into(),
+                "ful".into(),
+                "friend".into(),
+                "!".into(),
+            ],
+            offsets: vec![
+                (0, 2),
+                (2, 5),
+                (7, 10),
+                (10, 13),
+                (13, 16),
+                (17, 23),
+                (23, 24),
+            ],
+            words: vec![
+                Some(0),
+                Some(0),
+                Some(1),
+                Some(1),
+                Some(1),
+                Some(2),
+                Some(3),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(encoding.word_to_tokens(0), Some((0, 2)));
+        assert_eq!(encoding.word_to_tokens(1), Some((2, 5)));
+        assert_eq!(encoding.word_to_tokens(2), Some((5, 6)));
+        assert_eq!(encoding.word_to_tokens(3), Some((6, 7)));
+
+        assert_eq!(encoding.word_to_chars(0), Some((0, 5)));
+        assert_eq!(encoding.word_to_chars(1), Some((7, 16)));
+
+        assert_eq!(encoding.token_to_chars(0), Some((0, 2)));
+        assert_eq!(encoding.token_to_chars(1), Some((2, 5)));
+
+        assert_eq!(encoding.token_to_word(1), Some(0));
+        assert_eq!(encoding.token_to_word(2), Some(1));
+        assert_eq!(encoding.token_to_word(7), None);
+
+        assert_eq!(encoding.char_to_token(3), Some(1));
+        assert_eq!(encoding.char_to_token(8), Some(2));
+        assert_eq!(encoding.char_to_token(16), None);
+        assert_eq!(encoding.char_to_token(23), Some(6));
+
+        assert_eq!(encoding.char_to_word(3), Some(0));
+        assert_eq!(encoding.char_to_word(8), Some(1));
+        assert_eq!(encoding.char_to_word(16), None);
+        assert_eq!(encoding.char_to_word(23), Some(3));
     }
 }
