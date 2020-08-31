@@ -34,6 +34,7 @@ We provide bindings to the following languages (more to come!):
   - [Rust](https://github.com/huggingface/tokenizers/tree/master/tokenizers) (Original implementation)
   - [Python](https://github.com/huggingface/tokenizers/tree/master/bindings/python)
   - [Node.js](https://github.com/huggingface/tokenizers/tree/master/bindings/node)
+  - [WASM](https://github.com/mikbry/tokenizers/tree/master/bindings/wasm) Experimental
  
 ## Quick examples using Python:
 
